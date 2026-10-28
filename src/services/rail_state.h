@@ -13,6 +13,7 @@ typedef struct RailState {
 
 RailState railStateRead(void);
 void railStateInvalidateFromIsr(void);          // ISR-safe
+void railStateInvalidate(void);                 // task context (PowerCoordinator polling fallback)
 void railStateRestore(uint32_t expectedEpoch);  // PowerCoordinator only
 
 // Accept a 5 V result only if the rail was valid before and after and the

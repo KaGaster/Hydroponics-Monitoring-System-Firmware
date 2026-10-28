@@ -44,9 +44,12 @@
 // WP9 low-power mode (services/power_coordinator.h). 1 = losing the external
 // 5 V moves sensing to the low-power worker (3.3 V sensors only) and switches
 // Wi-Fi off. 0 = kill switch: report the sense level only, change nothing.
-// Not hardware-tested yet (written before the circuit existed): if a power
-// transition misbehaves on the bench, set 0 and report it.
-#define POLICY_POWER_TRANSITIONS_ENABLED 1
+// OFF until the WP9 bench check (README "Low-power mode (WP9)"): the code
+// has not run on hardware, and GPIO8 has no pull, so without the sense
+// divider wired the board would boot into low power or flap. Architecture
+// §19: do not activate transitions before the sense input and rail behaviour
+// are verified. Set 1 for that bench check.
+#define POLICY_POWER_TRANSITIONS_ENABLED 0
 
 // Retry interval for a driver whose init() failed (§18: bounded, no loop).
 #define POLICY_INIT_RETRY_MS ((uint32_t)5000)

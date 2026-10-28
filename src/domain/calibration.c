@@ -72,7 +72,10 @@ bool phFitFromBuffers(float mv1, float ph1, float mv2, float ph2, float minAbsSl
   if (!(dph <= -1.0f || dph >= 1.0f)) return false;  // also NaN
   LinearCalibration fit;
   if (!linearFromTwoPoints(mv1, ph1, mv2, ph2, revision, &fit)) return false;
-  const float mag = fit.slope < 0.0f ? -fit.slope : fit.slope;
+  // The pH-4502C output rises as pH falls: a positive slope means the two
+  // buffers were swapped, and would read plausible but wrong pH as OK.
+  if (!(fit.slope < 0.0f)) return false;
+  const float mag = -fit.slope;
   if (!(mag >= minAbsSlope && mag <= maxAbsSlope)) return false;
   *out = fit;
   return true;

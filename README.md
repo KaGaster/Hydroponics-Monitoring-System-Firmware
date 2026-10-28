@@ -8,7 +8,8 @@
 > **Status (28 Oct 2026):** WP1-WP8 done; WP8 8.0-8.4 hardware-tested, then
 > the LAN link removed (Bluetooth is the only app link), on-device calibration
 > added, and WP9 low-power mode written. The calibration and WP9 code is
-> **host-tested and builds but has not been flashed yet** (no circuit). See
+> **host-tested and builds but has not been flashed yet** (no circuit), and WP9
+> transitions ship **off** (`POLICY_POWER_TRANSITIONS_ENABLED 0`) until then. See
 > "Connecting the app", "On-device calibration" and "Low-power mode (WP9)".
 
 ## Connecting the app
@@ -64,9 +65,10 @@ The Stage 4 FreeRTOS design (tasks, scheduling, channels, Safety, supervision) i
 [`RTOS Architecture.pdf`](RTOS%20Architecture.pdf); its source is [`docs/rtos/`](docs/rtos/)
 (`python docs/rtos/build.py`, reuses the kit in `docs/architecture/`).
 
-**Status: Stage 1 skeleton plus first drivers.** The shared contracts are in
-place and every module exists and compiles. The BME280 (WP1), DS18B20 (WP2), light (WP3), HC-SR04 (WP4),
-pH and TDS (WP5) and SGP30 (WP6) drivers are written; the others are still stubs (see "Work packages").
+**Status: implementation stages 1-6 written.** Every driver (WP1-WP6), acquisition,
+Safety and supervision (WP7, WP10), the BLE link and configuration (WP8) and the
+low-power machinery (WP9) are in the production image. What is still open is
+hardware evidence, not code: see the status note at the top and "Work packages".
 
 ## Language: C (migrated from C++, October 2026)
 
@@ -104,10 +106,10 @@ To write a new driver, copy the pattern in `drivers/bme280.c`. Write `static`
 functions taking a `SensorDriver*`, put them in one `static const SensorDriverOps`
 table, and set `self->base.ops` to that table in `<name>DriverConstruct()`.
 
-`NimBLE-Arduino` and `ArduinoJson` stay pinned in `platformio.ini`, but both are C++
-libraries and no project code uses them. From C, WP8 can use the NimBLE host C
-API (`ble_gatts_*`, `ble_gap_*`) that NimBLE-Arduino bundles, and cJSON or `snprintf`
-for frames.
+`NimBLE-Arduino` and `ArduinoJson` stay pinned in `platformio.ini`. NimBLE-Arduino is
+used only by the C++ shim `src/transports/ble_gatt.cpp` (production images, WP8);
+ArduinoJson is not used by project code (JSON is built with `snprintf` in
+`domain/protocol_codec`).
 
 ## Layout (§7)
 
@@ -174,7 +176,7 @@ no field, order or size change.
 | WP4 | HC-SR04 + pulse capture (GPIO edge ISR + `esp_timer`) | `drivers/hcsr04.*`, `hal/pulse_capture.*`, `domain/ultrasonic.*` | 3 | ECHO divider verified (**driver written 24 Oct 2026, nominal 343 m/s, no temperature compensation; not yet run on hardware** — see "HC-SR04 bring-up") |
 | WP5 | pH + TDS, calibration | `drivers/ph.*`, `drivers/tds.*`, `domain/calibration.*`, `domain/tds_codec.*` | 3 | — (**pH driver + ADC HAL written 17 Oct 2026, builds; not yet run on hardware, uncalibrated** — see "pH-4502C calibration". **TDS driver written 24 Oct 2026, nominal datasheet curve (uncalibrated); running on S3 hardware 24 Oct 2026: air 0 mV, tap ~1245 mV, hot ~1922 mV, salted water over range (FAULT); compensation checked with the DS18B20 in `test_water` (switched to ppm/EC compensation, ~5 % across 11-34 degC); reference solution not yet tested** — see "SEN0244 TDS bring-up") |
 | WP6 | SGP30 air quality (TVOC, CO2eq) on the shared I2C bus | `drivers/sgp30.*`, `domain/sgp30_codec.*`, `hal/i2c_bus.*` (raw write/read), `test/bringup/sgp30_main.c`, `test/bringup/climate_main.c` | 2 | — (**running on S3 hardware 22 Oct 2026: feature set 0x0020 @0x58, 1 s cadence, 13 ms per measurement, no CRC faults; breath and hand-sanitiser spikes seen. Runs with the BME280 on the shared bus in `test_climate`, with humidity compensation. Baseline save/restore, 12 h learning and fault recovery not yet tested**; baseline is RAM-only until WP8 stores it in NVS) |
-| WP7 | Acquisition scheduler, Safety, alarm rules, snapshot | `services/acquisition.*`, `services/safety.*`, `domain/alarm.*`, `domain/schedule.*`, `domain/safety_core.*`, `include/policy_config.h` | 4 | — (**domain logic done 25 Oct 2026**: rule evaluation with hysteresis/persistence/staleness, absolute-deadline job table with skip-not-catch-up, pure Safety state machine with lamp policy, stale → OFF and DEENERGIZE interlock; 41 host tests. **Services written 25 Oct 2026, builds, not yet run on hardware:** AcqNormal runs all 7 drivers as the single worker (D15); Safety task owns the relay (`hal/relay.c`); `main.c` boots safe outputs → logger → Safety → acquisition → Supervisor. Readings are stamped with the rail epoch but **not gated on 5 V validity until WP9**. Thresholds still placeholders: rules ship **disabled** in `policy_config.h`; lamp auto-control **enabled**) |
+| WP7 | Acquisition scheduler, Safety, alarm rules, snapshot | `services/acquisition.*`, `services/safety.*`, `domain/alarm.*`, `domain/schedule.*`, `domain/safety_core.*`, `include/policy_config.h` | 4 | — (**domain logic done 25 Oct 2026**: rule evaluation with hysteresis/persistence/staleness, absolute-deadline job table with skip-not-catch-up, pure Safety state machine with lamp policy, stale → OFF and DEENERGIZE interlock; 41 host tests. **Services written 25 Oct 2026, builds, not yet run on hardware:** AcqNormal runs all 7 drivers as the single worker (D15); Safety task owns the relay (`hal/relay.c`); `main.c` boots safe outputs → logger → Safety → acquisition → Supervisor. Readings are stamped with the rail epoch; since WP9 the 5 V sensors are also gated on its validity (with transitions on). Thresholds still placeholders: rules ship **disabled** in `policy_config.h`; lamp auto-control **enabled**) |
 | WP8 | Wi-Fi/MQTT, BLE, protocol, configuration, desktop app update | `transports/*`, `services/configuration.*`, `services/flash_gate.*`, `domain/protocol_codec.*`, `domain/frame_codec.*`, `domain/config_blob.*`, `domain/event_journal.*`, `domain/backoff.*`, `domain/sensor_set.*` | 5 | — (**8.0** contract v2 and desktop app v2 done; **Spike A** NimBLE pairing run on hardware 25–27 Oct 2026. **8.1** domain logic done, host-tested. **8.2** Configuration + NVS done and bench-tested 27 Oct 2026 (see "Configuration and NVS"). **8.3** BLE transport in every production image, D14 under BLE passed (see "BLE transport"). **8.4** Wi-Fi station + read-only LAN link written 27 Oct 2026 and bench-tested. **28 Oct 2026, written, not flashed (no circuit):** the LAN link (TCP 47800, mDNS, token ops) is **removed**: the app connects over Bluetooth only and Wi-Fi is a controller setting. **On-device calibration** for pH, TDS and light (`get_calibration`, `cal_capture`, `set_calibration`, `reset_calibration`; ConfigBlob schema 2 with schema-1 migration; see "On-device calibration"). No server/MQTT yet) |
 | WP9 | Power ISR, rail epoch, lease handover | `domain/power_mode.*`, `services/power_coordinator.*`, `services/rail_state.*`, `services/acquisition.*` | 6 | — (power sense on GPIO8 measured 25 Oct 2026. **Written 28 Oct 2026, host-tested (8 state-machine tests), builds, NOT run on hardware yet:** see "Low-power mode (WP9)". Kill switch `POLICY_POWER_TRANSITIONS_ENABLED`) |
 | WP10 | Logger queue, supervisor, watchdogs | `diagnostics/*`, `services/supervisor.*` | 4 | — (**written and run on S3 hardware 25 Oct 2026; stall tests PASS** (see "Production run"): logger queue + SerialLogger task (drop and count); cross-core progress stamps; Supervisor checks progress deadlines (Safety 1 s, AcqNormal 2 s, logger 2 s when busy), loss/lateness counters, stack high-water marks and internal heap; AcqNormal and Safety subscribed to the 5 s task watchdog, each resetting it only for itself; `stall_acq` / `stall_safety` envs for the §19 stall test) |
@@ -293,8 +295,9 @@ TRIP/CLEAR lines) has not executed yet, so its stack figure excludes it.
 
 Known limits: if the light S wire is pulled, the 1 uF capacitor decays to ~0 mV,
 which reads as darkness and switches the lamp ON; firmware cannot detect it.
-Alarm rules are all disabled (no commissioned thresholds). Readings are not
-gated on the 5 V rail until WP9.
+Alarm rules are all disabled (no commissioned thresholds). Since WP9, 5 V
+readings are gated on the rail epoch, but only while
+`POLICY_POWER_TRANSITIONS_ENABLED` is 1 (off until the WP9 bench check).
 
 ## BLE Spike A (WP8 Stage 8.0, historical)
 
@@ -537,7 +540,7 @@ NVS namespace `hydro`:
 | `sgp_base` | SGP30 baseline | offered by acquisition hourly once valid; written only if it changed, at most once an hour |
 | `rst_hist` | last 8 `esp_reset_reason()` codes | once per boot, 30 s after start (never during a reset loop) |
 
-**Only the sensor mask is set by a command so far.** The lamp policy and the pH/TDS calibration still come from `include/policy_config.h`: the blob copies them, but `configBlobRefreshDefaults()` overwrites them from the source on every boot. A re-measured value in the source therefore always wins over an old copy in flash, and the revision goes up when it changes. RTOS §14.1's NVS-backed thresholds wait for a set-calibration command, which will add an "overridden" flag.
+**Set by command:** the sensor mask (`set_sensor_enabled`) and, since 28 Oct 2026, the pH / TDS / light calibrations (`set_calibration`, `reset_calibration`; see "On-device calibration"). The lamp policy still comes from `include/policy_config.h`: `configBlobRefreshDefaults()` copies it, and every calibration whose `calOverridden` bit is clear, from the source on every boot. A re-measured value in the source therefore wins over an old copy in flash (the revision goes up when it changes), but never over a calibration made on the device.
 
 **Boot.** `configurationInit()` runs before Safety and acquisition. It loads the config, publishes it, and returns. If NVS fails, the compiled defaults apply: all sensors on, nothing stored.
 
@@ -638,7 +641,7 @@ the next frame boundary (`applyConfiguration()` -> `phDriverSetCalibration` /
 
 | Sensor | Points | x (raw, from `cal_capture`) | Fit, plausibility (`policy_config.h`) | After |
 | --- | --- | --- | --- | --- |
-| pH | 2 buffers >= 1 pH apart | module mV (pin mV through the 10k/15k divider) | two-point line, \|slope\| 0.002-0.02 pH/mV | pH `OK` (no longer provisional) |
+| pH | 2 buffers >= 1 pH apart | module mV (pin mV through the 10k/15k divider) | two-point line, slope negative, \|slope\| 0.002-0.02 pH/mV (swapped buffers refused) | pH `OK` (no longer provisional) |
 | TDS | 1 reference solution | ppm at 25 degC on the nominal curve, before K | K = ref / x, 0.5-2.0 | TDS `OK` |
 | Light | 1 lux-meter reading | pin mV | lux per mV through zero, 0.01-100 | light in `lux` (`UNIT_LUX`), `OK` |
 
@@ -691,8 +694,13 @@ Before this date `power_coordinator.c` was a stub: State always reported
   State's `power_epoch` is now the live rail epoch.
 - **Deviation from §15:** Safety stays on core 1 (D14 move, 28 Oct 2026), so
   core 1 is not idle in low power. CPU frequency and light sleep are unchanged.
-- **Kill switch:** `POLICY_POWER_TRANSITIONS_ENABLED 0` in `policy_config.h`:
+- **Kill switch:** `POLICY_POWER_TRANSITIONS_ENABLED` in `policy_config.h`.
+  **Shipped as 0 since 28 Oct 2026 (audit)** until the bench check below:
   no ISR, every sensor on the normal worker, the mode only reports the level.
+  Set it to 1 for the bench check.
+- **Polling fallback:** if the GPIO ISR cannot be installed (transitions on),
+  PowerCoord samples the pin every 10 ms and invalidates the rail itself on a
+  level change (up to one tick later than the ISR would).
 - **Bench checks to run once the circuit exists:** unplug the 5 V feed with the
   app connected: NORMAL -> TRANSITION_TO_LOW -> LOW_POWER within ~0.3 s, Wi-Fi
   off, pH / TDS / level `UNPOWERED`, relay off, BLE still up; replug: back to
@@ -705,11 +713,11 @@ Before this date `power_coordinator.c` was a stub: State always reported
   - In low power the DS18B20 1-Wire timing (interrupts masked) runs on core 0
     next to the BT controller: check that BLE stays stable, since it is now
     the only link.
-- **Before the first flash:** this ships with transitions ON and GPIO8 has no
-  pull. Without the sense divider wired, the board boots into low power (or
-  flaps if the pin floats). Wire the divider, or set
-  `POLICY_POWER_TRANSITIONS_ENABLED 0`, before flashing. This also applies to
-  `alarm_latency` and the stall test envs.
+- **Before setting transitions to 1:** GPIO8 has no pull. Without the sense
+  divider wired, the board boots into low power (or flaps if the pin floats).
+  Wire and check the divider first. This also applies to `alarm_latency` and
+  the stall test envs. A spurious edge on GPIO8 turns the lamp off for at
+  least `POLICY_LAMP_MIN_OFF_MS`: watch for that on the real wiring.
 
 ## DS18B20 bring-up (WP2)
 
@@ -736,8 +744,8 @@ once (~12 ms).
 | `init -> FAULT` repeatedly on a sensor that answers | the scratchpad config byte fails the fixed-bit check; suspect a clone part |
 
 The TDS driver takes this reading through `tdsDriverSetWaterTemperature()`.
-`test_water` (see "Water probes together") passes it across in bring-up.
-Production acquisition (WP7) still has to do the same.
+`test_water` (see "Water probes together") passes it across in bring-up, and
+production acquisition does the same before every TDS start (`prepareInputs()`).
 
 ```bash
 pio run -e test_ds18b20 -t upload -t monitor
@@ -1142,6 +1150,7 @@ just before the port (baseline) and once from the C tree.
   sent a bare `\n`. It also mirrors output to the native USB-Serial-JTAG port
   (`CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG`). `pio device monitor` on UART0 at
   115200 is unaffected. Scripts that parse logs byte for byte should allow `\r\n`.
-- **Not yet re-verified on hardware:** the BME280 bring-up on the S3 (WP1 above was
-  measured with the C++ build) and the console output described above. Re-run
-  `pio run -e test_bme280 -t upload -t monitor` before relying on the C build.
+- **Re-verified on hardware since:** the C production image ran on the S3 on
+  25 Oct 2026 with all 7 drivers `init OK` and `health OK` (BME280 included),
+  over the UART console (see "Production run"). The `test_bme280` bring-up's
+  fault/recovery checks are still pending.

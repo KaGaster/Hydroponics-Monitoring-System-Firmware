@@ -114,12 +114,18 @@ static void powerTask(void* arg) {
     isr = armIsr();
     if (!isr) logPrintf(LOG_LEVEL_ERROR, "power: GPIO ISR service not ready - polling the sense pin only");
   }
+  const bool polling = POLICY_POWER_TRANSITIONS_ENABLED && !isr;
   bool lastHigh = senseHigh();
+  bool lastPolled = lastHigh;
   MonoMs sinceMs = monoNowMs();
   for (;;) {
     const MonoMs now = monoNowMs();
-    const RailState rail = railStateRead();  // one coherent {valid, epoch} per tick
     const bool high = senseHigh();
+    // Without the ISR, a level change seen here is the edge: invalidate the
+    // rail as the ISR would (later than the ISR, by up to one tick).
+    if (polling && high != lastPolled) railStateInvalidate();
+    lastPolled = high;
+    const RailState rail = railStateRead();  // one coherent {valid, epoch} per tick
     const PowerModeInputs in = {now, high, rail.valid5v, acquisitionReleasedGeneration(), wifiMqttRadioOff(),
                                 rail.epoch, isr && !s_isrArmed};
     PowerModeActions a;
@@ -131,7 +137,7 @@ static void powerTask(void* arg) {
     progressMark(TASK_ID_POWER_COORDINATOR);
     esp_task_wdt_reset();
     const bool busy = s_fsm.mode != POWER_MODE_NORMAL && s_fsm.mode != POWER_MODE_LOW_POWER;
-    const bool settling = !high || !in.railValid || (isr && !s_isrArmed);
+    const bool settling = !high || !in.railValid || (isr && !s_isrArmed) || polling;
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(busy || settling ? POWER_TICK_MS : POWER_IDLE_TICK_MS));
   }
 }

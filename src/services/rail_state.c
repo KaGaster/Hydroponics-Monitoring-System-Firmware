@@ -26,6 +26,13 @@ void railStateInvalidateFromIsr(void) {
   portEXIT_CRITICAL_ISR(&s_railMux);
 }
 
+void railStateInvalidate(void) {
+  portENTER_CRITICAL(&s_railMux);
+  s_rail.valid5v = false;
+  s_rail.epoch++;
+  portEXIT_CRITICAL(&s_railMux);
+}
+
 void railStateRestore(uint32_t expectedEpoch) {
   portENTER_CRITICAL(&s_railMux);
   if (s_rail.epoch == expectedEpoch) s_rail.valid5v = true;

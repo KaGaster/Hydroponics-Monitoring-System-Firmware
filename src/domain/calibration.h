@@ -47,7 +47,8 @@ float trimmedMeanU32(uint32_t* samples, uint8_t n, uint8_t trim);
 bool linearGainFromPoint(float x1, float y1, float minGain, float maxGain, uint16_t revision,
                          LinearCalibration* out);
 
-// Two-point pH buffer fit, rejected unless |slope| (pH per module mV) is in
-// [minAbsSlope, maxAbsSlope] and the buffers are at least 1 pH apart.
+// Two-point pH buffer fit, rejected unless the slope (pH per module mV) is
+// negative, |slope| is in [minAbsSlope, maxAbsSlope] and the buffers are at
+// least 1 pH apart. A positive slope means the buffer values were swapped.
 bool phFitFromBuffers(float mv1, float ph1, float mv2, float ph2, float minAbsSlope, float maxAbsSlope,
                       uint16_t revision, LinearCalibration* out);

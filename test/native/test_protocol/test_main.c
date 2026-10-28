@@ -484,6 +484,12 @@ static void test_calibration_fits(void) {
   TEST_ASSERT_FALSE(c.valid);
   TEST_ASSERT_FALSE(phFitFromBuffers(2500.0f, 7.0f, 2600.0f, 6.5f, 0.002f, 0.02f, 5, &c));  // < 1 pH apart
   TEST_ASSERT_FALSE(phFitFromBuffers(2500.0f, 7.0f, 2500.0f, 4.0f, 0.002f, 0.02f, 5, &c));  // same mV
+  // Buffer values swapped: slope +0.00566 pH/mV, plausible size, wrong sign.
+  TEST_ASSERT_FALSE(phFitFromBuffers(2500.0f, 4.0f, 3030.0f, 7.0f, 0.002f, 0.02f, 5, &c));
+  TEST_ASSERT_FALSE(c.valid);
+  // Same buffers entered in the other order: still a valid (negative) fit.
+  TEST_ASSERT_TRUE(phFitFromBuffers(3030.0f, 4.0f, 2500.0f, 7.0f, 0.002f, 0.02f, 5, &c));
+  TEST_ASSERT_FLOAT_WITHIN(1e-3f, 7.0f, linearApply(&c, 2500.0f));
   // TDS K: 650 ppm nominal in a 707 ppm solution.
   TEST_ASSERT_TRUE(linearGainFromPoint(650.0f, 707.0f, 0.5f, 2.0f, 0, &c));
   TEST_ASSERT_FLOAT_WITHIN(1e-4f, 707.0f / 650.0f, c.slope);
