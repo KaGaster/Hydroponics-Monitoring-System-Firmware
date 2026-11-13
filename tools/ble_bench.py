@@ -1,7 +1,7 @@
 """Configuration bench over BLE, driven by the desktop app's own BleLink.
 
-The PC must already be bonded with the ESP (pair once from the app), so no
-passkey is needed. Run with the app's virtual environment:
+No pairing or passkey is needed (open link, firmware 0.11.0+). Close the app
+first: the ESP takes one client at a time. Run with the app's virtual environment:
 
   APP=app
   $APP/.venv/Scripts/python tools/ble_bench.py $APP before
@@ -47,7 +47,7 @@ async def connect() -> BleLink:
         targets = await scan_ble(6.0)
         if targets:
             link = BleLink(on_message, lambda _l, reason: print("disconnected:", reason))
-            await link.connect(targets[0], "")
+            await link.connect(targets[0])
             await asyncio.sleep(7)  # a State and two Telemetry frames
             return link
     raise SystemExit("controller not found")

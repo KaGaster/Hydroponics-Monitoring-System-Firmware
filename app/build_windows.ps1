@@ -12,7 +12,7 @@ if (-not $?) { exit 1 }
 
 # Imported lazily (per platform / per mode), so listed for PyInstaller.
 $hidden = @(
-    "BleLink", "DemoController", "Pairing", "WinPairing",
+    "BleLink", "DemoController", "OsBond",
     "winrt.windows.devices.bluetooth", "winrt.windows.devices.enumeration", "winrt.windows.foundation"
 )
 

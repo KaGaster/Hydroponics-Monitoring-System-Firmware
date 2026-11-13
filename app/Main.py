@@ -159,6 +159,9 @@ class ControlApp:
         """Ages ("12 s ago"), state staleness and link badges move without new frames."""
         while not self.closed:
             await asyncio.sleep(2)
+            # Hardware diagnostics: one small request per 10 s, only while someone looks at them.
+            if self.current == "Dashboard" and self.session.diagnostics_due:
+                self.run(self.session.refresh_diagnostics)
             if self.current in ("Dashboard", "Sensors", "Calibration", "Connection", "Wi-Fi"):
                 self.refresh_page("tick")
             else:

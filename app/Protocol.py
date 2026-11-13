@@ -16,15 +16,13 @@ STATE_UUID = "98a90f01-346e-4e65-9cbd-7687685bdc01"
 TELEMETRY_UUID = "98a90f02-346e-4e65-9cbd-7687685bdc01"
 COMMAND_UUID = "98a90f03-346e-4e65-9cbd-7687685bdc01"
 RESULT_UUID = "98a90f04-346e-4e65-9cbd-7687685bdc01"
-AUTH_UUID = "98a90f05-346e-4e65-9cbd-7687685bdc01"
-AUTH_VALUE = b"HYDRO_SECURE_V1"
 
 VERSION = 2
 MAX_MESSAGE = 4096
 
 COMMANDS = {
     "get_sensors", "set_sensor_enabled", "reset_latch", "set_wifi", "forget_wifi",
-    "get_calibration", "cal_capture", "set_calibration", "reset_calibration",
+    "get_calibration", "cal_capture", "set_calibration", "reset_calibration", "get_diagnostics",
 }
 # Sensors calibrated on the device (Calibration page). Values on the wire are
 # scaled integers: x = raw input x x_scale, y = reference x y_scale.
@@ -200,3 +198,51 @@ def parse_calibration(data: dict) -> dict:
             "offset": float(numbers[1]),
         }
     return out
+
+
+def parse_diagnostics(data: dict) -> dict:
+    """get_diagnostics result -> hardware figures; a section that is missing or malformed becomes None."""
+    if not isinstance(data, dict):
+        raise ValueError("Malformed diagnostics")
+    u32 = 2**32 - 1
+
+    def section(name, keys):
+        entry = data.get(name)
+        if not isinstance(entry, dict):
+            return None
+        values = {key: _int(entry.get(key), 0, u32) for key in keys}
+        return None if any(v is None for v in values.values()) else values
+
+    cpu = data.get("cpu")
+    cores = None
+    if isinstance(cpu, list) and cpu:
+        cores = []
+        for core in cpu[:2]:
+            load = _int(core.get("load"), 0, 100) if isinstance(core, dict) else None
+            peak = _int(core.get("peak"), 0, 100) if isinstance(core, dict) else None
+            if load is None or peak is None:
+                cores = None
+                break
+            cores.append({"load": load, "peak": max(peak, load)})
+    stacks = []
+    for item in data.get("stacks") if isinstance(data.get("stacks"), list) else []:
+        if not isinstance(item, dict) or not isinstance(item.get("task"), str):
+            continue
+        size, free_min = _int(item.get("size"), 1, u32), _int(item.get("free_min"), 0, u32)
+        core = _int(item.get("core"), 0, 1)
+        if size is None or free_min is None or core is None:
+            continue
+        stacks.append({"task": item["task"][:16], "core": core, "size": size, "free_min": min(free_min, size)})
+    heap = section("heap", ("total", "free", "min", "largest"))
+    if heap is not None and not heap["free"] <= heap["total"]:
+        heap = None
+    return {
+        "uptime_ms": _int(data.get("uptime_ms")) or 0,
+        "reset_reason": _text(data.get("reset_reason"), 16, "UNKNOWN") or "UNKNOWN",
+        "cpu_mhz": _int(data.get("cpu_mhz"), 0, 1000) or 0,
+        "cpu": cores,
+        "heap": heap,
+        "psram": section("psram", ("total", "free")),
+        "flash": section("flash", ("app_partition", "nvs_used", "nvs_total")),
+        "stacks": stacks[:16],
+    }

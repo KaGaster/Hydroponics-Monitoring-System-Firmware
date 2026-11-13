@@ -28,7 +28,7 @@ class Link:
         self.connected = False
         self.target: Target | None = None
 
-    async def connect(self, target: Target, secret: str = "") -> None:
+    async def connect(self, target: Target) -> None:
         raise NotImplementedError
 
     async def disconnect(self) -> None:

@@ -1,4 +1,6 @@
-"""Connection: Bluetooth discovery, pairing, disconnect / forget, demo switches.
+"""Connection: Bluetooth discovery, connect / disconnect, demo switches.
+
+The link is open: no passkey and no pairing step. Scan, then Connect.
 
 Bluetooth is the only link to the controller. Wi-Fi is a controller setting
 on the Wi-Fi page, not a way to connect.
@@ -14,9 +16,6 @@ class ConnectionPage:
 
     def __init__(self, app):
         self.app = app
-        self.passkey = ft.TextField(label="Passkey (first pairing only)", hint_text="6 digits from the ESP serial log",
-                                    width=280, max_length=6, input_filter=ft.NumbersOnlyInputFilter(),
-                                    password=True, can_reveal_password=True)
         self.targets = []
         self.scanning = False
         self.busy = False
@@ -36,9 +35,9 @@ class ConnectionPage:
             Theme.card([
                 Theme.title("Find a controller", 17),
                 Theme.caption("The app talks to the controller over Bluetooth only. Keep the ESP powered and "
-                              "within range. The first pairing asks for the passkey printed on its serial log."),
+                              "within range, scan, then choose Connect. No passkey or pairing is needed. "
+                              "The controller serves one computer at a time."),
                 ft.Row([self.scan_button, self.scan_ring], spacing=12),
-                self.passkey,
                 self.results,
             ]),
         ]
@@ -83,9 +82,6 @@ class ConnectionPage:
         if s.connected or s.ble_reconnecting:
             actions.append(ft.OutlinedButton("Disconnect", icon=ft.Icons.LINK_OFF_ROUNDED,
                                              on_click=lambda e: self.app.run(self._disconnect)))
-        if s.ble_target is not None:
-            actions.append(ft.TextButton("Forget this controller", icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
-                                         on_click=lambda e: self._confirm_forget()))
         self.actions.controls = actions
         self.scan_button.disabled = self.scanning or self.busy
         self.scan_ring.visible = self.scanning
@@ -118,7 +114,8 @@ class ConnectionPage:
         try:
             self.targets = await self.app.session.scan()
             if not self.targets:
-                self.app.notice("No controller found. Check that it is powered and close by.")
+                self.app.notice("No controller found. Check that it is powered and close by, and that no other "
+                                "computer is connected to it (it serves one at a time).")
         finally:
             self.scanning = False
             self.app.refresh_page()
@@ -127,8 +124,7 @@ class ConnectionPage:
         self.busy = True
         self.app.refresh_page()
         try:
-            await self.app.session.connect_ble(target, (self.passkey.value or "").strip())
-            self.passkey.value = ""
+            await self.app.session.connect_ble(target)
             self.app.notice(f"Connected to {target.label} over Bluetooth.")
             self.app.navigate("Dashboard")
         except Exception as error:
@@ -140,20 +136,3 @@ class ConnectionPage:
     async def _disconnect(self) -> None:
         await self.app.session.disconnect()
         self.app.notice("Disconnected.")
-
-    def _confirm_forget(self) -> None:
-        async def forget(_event):
-            self.app.page.pop_dialog()
-            try:
-                await self.app.session.forget()
-                self.app.notice("Pairing removed from this computer. Clear the bond on the ESP (hold BOOT 10 s) "
-                                "before pairing again.")
-            except Exception as error:
-                self.app.notice(self.app.explain(error))
-
-        self.app.page.show_dialog(ft.AlertDialog(
-            modal=True, title=ft.Text("Forget this controller?"),
-            content=ft.Text("This removes the Bluetooth pairing from this computer. Recorded metrics are kept."),
-            actions=[ft.TextButton("Cancel", on_click=lambda e: self.app.page.pop_dialog()),
-                     ft.FilledButton("Forget", on_click=forget)],
-        ))

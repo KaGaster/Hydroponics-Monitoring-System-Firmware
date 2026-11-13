@@ -4,8 +4,8 @@ No UI code here, so it can be tested with the demo controller. Rules:
 
 - Bluetooth is the only link to the controller: it carries the data and the
   commands. Wi-Fi is a controller setting (Wi-Fi page), never a link for the
-  app. A lost Bluetooth link is re-established without a passkey (the bond
-  exists).
+  app. The link is open (no passkey, no pairing), so any computer can
+  connect, and a lost link is re-established automatically.
 - Every telemetry frame is recorded, whatever page is open; the store keeps
   one row per (node, boot, metric, seq), so the 3 s re-sends of a sample
   merge.
@@ -18,11 +18,13 @@ from typing import Callable
 
 from Catalog import SENSORS, SensorInfo, sensor_parse
 from Links import Target
-from Protocol import CALIBRATABLE, parse_calibration, parse_event, parse_state, parse_telemetry
+from Protocol import CALIBRATABLE, parse_calibration, parse_diagnostics, parse_event, parse_state, parse_telemetry
 from Store import Store
 
 STATE_STALE_S = 15
 TELEMETRY_STALE_S = 10  # three 3 s frames missed
+DIAGNOSTICS_EVERY_S = 10  # get_diagnostics poll, only while the Dashboard is open
+DIAGNOSTICS_STALE_S = 30
 BLE_RETRY_DELAYS = (2, 4, 8)
 GLOBAL = "*"  # Settings row owner for app-wide settings
 
@@ -56,6 +58,11 @@ class Session:
         self.readings: dict[str, dict] = {}
         self.sensors: list[SensorInfo] = list(SENSORS)
         self.calibration: dict[str, dict] = {}
+        self.diagnostics: dict | None = None  # hardware figures (get_diagnostics)
+        self.diagnostics_at = 0.0     # last answer
+        self.diagnostics_tried = 0.0  # last request, answered or not
+        self.diagnostics_supported = True  # False once the firmware answers unknown_op
+        self.diagnostics_busy = False
         self.ble_target: Target | None = None
         self.want_ble = False      # the user connected and did not disconnect
         self.ble_reconnecting = False
@@ -103,6 +110,15 @@ class Session:
         """State alone keeps the link looking alive: this says data is still flowing."""
         return self.connected and self.telemetry_at > 0 and time.monotonic() - self.telemetry_at < TELEMETRY_STALE_S
 
+    @property
+    def diagnostics_fresh(self) -> bool:
+        return self.diagnostics is not None and time.monotonic() - self.diagnostics_at < DIAGNOSTICS_STALE_S
+
+    @property
+    def diagnostics_due(self) -> bool:
+        return (self.can_command and self.diagnostics_supported and not self.diagnostics_busy
+                and time.monotonic() - self.diagnostics_tried >= DIAGNOSTICS_EVERY_S)
+
     def reading_age_s(self, reading: dict) -> float | None:
         if reading.get("age_ms") is None:
             return None
@@ -131,10 +147,11 @@ class Session:
 
     # ------------------------------------------------------------ connecting
 
-    async def connect_ble(self, target: Target, passkey: str = "") -> None:
-        await self.ble.connect(target, passkey)
+    async def connect_ble(self, target: Target) -> None:
+        await self.ble.connect(target)
         self.ble_target = target
         self.want_ble = True
+        self._clear_diagnostics()
         self._emit("link")
         await self._after_ble_connect()
 
@@ -153,15 +170,7 @@ class Session:
         await self.ble.disconnect()
         self.state = None
         self.readings.clear()
-        self._emit("link")
-
-    async def forget(self) -> None:
-        """Removes this computer's Bluetooth bond with the controller."""
-        target = self.ble_target
-        await self.disconnect()
-        if target is not None:
-            await self.ble.forget(target)
-        self.ble_target = None
+        self._clear_diagnostics()
         self._emit("link")
 
     # ------------------------------------------------------------ reconnect
@@ -182,16 +191,19 @@ class Session:
                     target = await self._rescan_ble(self.ble_target.address)
                     if target is None:
                         continue
-                    await self.ble.connect(target, "")
+                    await self.ble.connect(target)
                     self.ble_target = target
                     self._emit("link")
                     await self._after_ble_connect()
+                    if not self.ble.connected:
+                        # Lost again during the handshake. _on_disconnect() could not start
+                        # a new reconnect while this one runs, so keep retrying here.
+                        log.info("reconnect: link lost again right after connecting")
+                        continue
                     self.notify("Bluetooth reconnected.")
                     return
-                except ValueError:
-                    self.notify("The Bluetooth bond was lost. Open Connection and pair again with a new passkey.")
-                    return
-                except Exception:
+                except Exception as error:
+                    log.info("reconnect attempt failed: %s: %s", type(error).__name__, error)
                     await self.ble.disconnect()
             self.notify("Automatic reconnect stopped. Open Connection to try again.")
         finally:
@@ -215,6 +227,7 @@ class Session:
         if self.want_ble:
             self._start_ble_reconnect()
         self.state = None
+        self._clear_diagnostics()
         self._emit("link")
 
     # ------------------------------------------------------------ messages
@@ -241,6 +254,7 @@ class Session:
             self.readings.clear()
         if previous and previous["boot"] != state["boot"]:
             self.readings.clear()  # the controller restarted: sequence numbers start again
+            self._clear_diagnostics()
         if previous and previous["mode"] != state["mode"]:
             log.info("power mode: %s -> %s", previous["mode"], state["mode"])
         self.state = state
@@ -331,6 +345,34 @@ class Session:
     async def reset_calibration(self, sensor: str) -> None:
         await self.command("reset_calibration", {"sensor": sensor})
         await self.refresh_calibration()
+
+    # ------------------------------------------------------------ hardware diagnostics
+
+    def _clear_diagnostics(self) -> None:
+        self.diagnostics = None
+        self.diagnostics_at = self.diagnostics_tried = 0.0
+        self.diagnostics_supported = True  # another firmware may answer
+
+    async def refresh_diagnostics(self) -> None:
+        """Copies the controller's hardware snapshot; never notifies (it is a background poll)."""
+        if self.diagnostics_busy:
+            return
+        self.diagnostics_busy = True
+        self.diagnostics_tried = time.monotonic()
+        try:
+            data = await self.command("get_diagnostics", {})
+            self.diagnostics = parse_diagnostics(data)
+            self.diagnostics_at = time.monotonic()
+        except RuntimeError as error:
+            if str(error) == "unknown_op":
+                self.diagnostics_supported = False
+            else:
+                log.info("get_diagnostics: %s", error)
+        except Exception as error:
+            log.info("get_diagnostics: %s: %s", type(error).__name__, error)
+        finally:
+            self.diagnostics_busy = False
+        self._emit("diagnostics")
 
     async def close(self) -> None:
         self.closed = True

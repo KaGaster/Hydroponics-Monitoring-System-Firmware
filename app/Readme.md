@@ -2,7 +2,7 @@
 
 Desktop app for the ESP32 hydroponics controller, native on **Windows (.exe) and Linux**. It talks
 [contract v2](FirmwareContract.md) to the production firmware in this repository ([`../README.md`](../README.md), WP8 + WP9) over
-**Bluetooth LE only**: data and settings go over the bonded Bluetooth link. The controller's own Wi-Fi is
+**Bluetooth LE only**: data and settings go over an open Bluetooth link (no passkey, no pairing). The controller's own Wi-Fi is
 only a setting on the Wi-Fi page (for future server publishing); the app never connects over Wi-Fi.
 
 There is no server. The app keeps its own history and exports it. Run with `--demo` to use a built-in
@@ -17,9 +17,12 @@ simulator; no hardware is needed.
     readings, calibrated or not, carry no label.
   - Summary cards show the Bluetooth link, the power mode, the grow lamp (on/off and why), alarms and the
     number of samples recorded.
+  - **Controller hardware** (firmware 0.10.0+, `get_diagnostics` every 10 s while the Dashboard is open):
+    CPU load per core with a 60 s peak, RAM use, storage (PSRAM, NVS entries, app partition), and a power
+    estimate (`PowerModel.py`: power tree + measured CPU load; not a measurement).
   - A latched alarm shows a banner with **Reset**. The reset is refused while the condition persists.
-- **Connection**: Bluetooth scan, pairing with the passkey typed **in the app** (Linux and Windows),
-  automatic reconnect without a passkey, Disconnect and Forget this controller.
+- **Connection**: Bluetooth scan, then **Connect**: no passkey, no pairing. Automatic reconnect after a
+  link loss, and Disconnect.
 - **Wi-Fi**: the controller's network status and sending SSID and password over Bluetooth. In low-power
   mode the controller switches Wi-Fi off until external power returns.
 - **Metrics**: the history recorded on this computer.
@@ -83,14 +86,12 @@ python -m venv .venv
 
 Leave out `--demo` to use the real controller. The first start downloads the Flet desktop client once.
 
-**First pairing:**
+**Connecting:** open **Connection**, choose **Scan for controllers**, then **Connect** next to
+`Hydro-ESP1`. There is no passkey and nothing to pair (firmware 0.11.0+).
 
-1. Open the ESP's serial monitor and reset the board. It prints a six-digit passkey.
-2. In the app, open **Connection**, choose **Scan**, type the passkey and choose **Connect**.
-
-The app pairs through WinRT itself (`WinPairing.py`), so no Windows Settings dialog appears. bleak's own
-`pair()` only supports "Just Works", which the firmware refuses. Later connections reuse the Windows bond
-and need no passkey.
+If Windows still holds a pairing from older firmware, the app removes it before connecting (`OsBond.py`),
+so you never have to remove the device in Windows Settings. It also reads the GATT services uncached, so a
+table Windows cached from an older firmware is not reused.
 
 **Build the .exe:**
 
@@ -117,7 +118,7 @@ python3 -m venv .venv
 .venv/bin/python Main.py --demo
 ~~~
 
-Pairing works the same way. The app registers a temporary BlueZ passkey agent (`BluezPairing.py`).
+Connecting works the same way. A BlueZ pairing left from older firmware is removed first (`OsBond.py`).
 
 **Build the native Linux binary and launcher:**
 
@@ -130,13 +131,20 @@ installs it with the plant icon and a GNOME launcher for the current user. PyIns
 cross-compile: build on Linux (or WSL on a Windows PC), on the oldest distribution you want to run it on.
 Without `python3-venv` the script installs into a pip-less venv with your user pip instead.
 
-## One owner, and recovery
+## One computer at a time
 
-The controller accepts **one** bonded computer. To move to another computer, or after **Forget this
-controller**:
+The controller serves **one** computer at a time, but any computer can connect. It is not tied to an
+owner. To move to another computer, choose **Disconnect** (or close the app) on the first one. The ESP
+advertises again at once and shows up in the other computer's scan.
 
-1. Hold the ESP's **BOOT button for 10 s while it is running**. Not during reset: that enters download mode.
-2. Pair again with the new passkey.
+- If the first computer just vanished (closed lid, out of range), the ESP frees itself within about 4 s.
+- A connection that never subscribes (an operating system holding the link with no app on it) is dropped
+  after 20 s.
+
+There is no BOOT-button step and no reset needed.
+
+**Trade-off:** the link is not encrypted. Anyone within Bluetooth range can read the readings and send
+commands. That includes the Wi-Fi password sent from the Wi-Fi page, which travels in clear.
 
 ## Development
 
@@ -147,7 +155,7 @@ controller**:
 ~~~
 
 - **Tests:** they cover the protocol decoder and power modes, store dedupe and sample times, CSV/JSON export,
-  and the session against the demo controller (Bluetooth reconnect without passkey, pH / TDS / light
+  and the session against the demo controller (Bluetooth reconnect, connect with no passkey that clears a stale OS pairing, pH / TDS / light
   calibration and refused fits, low-power mode, and the refused disable while an alarm is latched).
 - **Demo switches:** in demo mode, the Connection page has switches for Bluetooth going out of range, the
   external 5 V (low-power mode), a controller Wi-Fi outage and an over-temperature alarm.
@@ -163,8 +171,9 @@ controller**:
 | `Theme.py`, `Charts.py` | Shared styling; canvas sparkline and trend chart |
 | `Session.py` | Bluetooth link and reconnect, recording, commands and calibration (no UI) |
 | `BleLink.py`, `Links.py` | Bluetooth (bleak) link |
-| `Pairing.py`, `WinPairing.py`, `BluezPairing.py` | Passkey pairing per platform |
+| `OsBond.py` | Removes an OS pairing left by firmware 0.10 or older (WinRT / BlueZ) |
 | `Protocol.py`, `Catalog.py`, `Meter.py` | Contract v2 framing and validation; metric labels; display bands |
+| `PowerModel.py` | Power estimate from the power tree and the ESP32-S3 datasheet |
 | `Store.py`, `Export.py` | SQLite history; CSV and JSON export |
 | `DemoController.py` | v2 simulator for `--demo` |
 | `assets/`, `tools/make_icon.py` | App icons and the script that makes them |

@@ -57,7 +57,7 @@ def test_wifi_setting_does_not_open_a_link(tmp_path):
     asyncio.run(scenario())
 
 
-def test_ble_lost_then_reconnects_without_passkey(tmp_path):
+def test_ble_lost_then_reconnects(tmp_path):
     async def scenario():
         s = await connected_session(tmp_path)
         s.demo_controller.set_ble_in_range(False)
@@ -65,6 +65,34 @@ def test_ble_lost_then_reconnects_without_passkey(tmp_path):
         assert not s.can_command
         s.demo_controller.set_ble_in_range(True)
         await wait_for(lambda: s.ble.connected)
+        await s.close()
+    asyncio.run(scenario())
+
+
+def test_link_lost_during_reconnect_handshake_is_retried(tmp_path, monkeypatch):
+    """A loss inside the reconnect's first get_sensors must not end the retries
+    (the old code announced "Bluetooth reconnected." and stayed offline)."""
+    from DemoController import DemoLink
+
+    async def scenario():
+        s = await connected_session(tmp_path)
+        original = DemoLink.send
+        armed = {"once": True}
+
+        async def send(self, operation, data):
+            if armed["once"] and operation == "get_sensors":
+                armed["once"] = False
+                self.drop("Bluetooth connection lost")
+                raise ConnectionError("Bluetooth connection lost")
+            return await original(self, operation, data)
+
+        monkeypatch.setattr(DemoLink, "send", send)
+        notices = []
+        s.notify = notices.append
+        s.ble.drop("Bluetooth connection lost")
+        await wait_for(lambda: not armed["once"])  # the handshake loss happened
+        await wait_for(lambda: s.ble.connected and not s.ble_reconnecting)
+        assert notices.count("Bluetooth reconnected.") == 1
         await s.close()
     asyncio.run(scenario())
 
@@ -135,5 +163,36 @@ def test_low_power_mode_round_trip(tmp_path):
         assert s.can_command  # Bluetooth stays up in low power
         s.demo_controller.set_external_power(True)
         await wait_for(lambda: s.power_mode == "normal")
+        await s.close()
+    asyncio.run(scenario())
+
+
+def test_diagnostics_from_the_demo_and_reset_on_disconnect(tmp_path):
+    async def scenario():
+        s = await connected_session(tmp_path)
+        assert s.diagnostics_due and s.diagnostics is None
+        await s.refresh_diagnostics()
+        d = s.diagnostics
+        assert s.diagnostics_fresh and not s.diagnostics_due
+        assert len(d["cpu"]) == 2 and d["heap"]["free"] <= d["heap"]["total"]
+        assert {item["task"] for item in d["stacks"]} >= {"Safety", "AcqNormal", "BleTransport"}
+        await s.disconnect()
+        assert s.diagnostics is None and not s.diagnostics_due
+        await s.close()
+    asyncio.run(scenario())
+
+
+def test_old_firmware_without_diagnostics(tmp_path):
+    async def scenario():
+        s = await connected_session(tmp_path)
+        original = s.demo_controller.command
+
+        async def older(operation, data):
+            if operation == "get_diagnostics":
+                raise RuntimeError("unknown_op")
+            return await original(operation, data)
+        s.demo_controller.command = older
+        await s.refresh_diagnostics()
+        assert not s.diagnostics_supported and s.diagnostics is None and not s.diagnostics_due
         await s.close()
     asyncio.run(scenario())

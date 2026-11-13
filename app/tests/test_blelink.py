@@ -69,3 +69,71 @@ def test_disconnect_closes_even_a_client_that_is_no_longer_connected():
         assert client.closed == 1
 
     asyncio.run(run())
+
+
+class FakeServices:
+    def get_characteristic(self, _uuid):
+        return object()
+
+
+class ConnectingClient(FakeClient):
+    """Stands in for BleakClient: records how it was built and what was asked."""
+    made = []
+
+    def __init__(self, device, **kwargs):
+        super().__init__()
+        self.device, self.kwargs = device, kwargs
+        self.services = FakeServices()
+        self.reads, self.notifies = [], []
+        ConnectingClient.made.append(self)
+
+    async def connect(self):
+        pass
+
+    async def start_notify(self, uuid, _callback):
+        self.notifies.append(uuid)
+
+    async def read_gatt_char(self, uuid):
+        self.reads.append(uuid)
+        return frame({"type": "state"})
+
+
+def test_connect_needs_no_passkey_and_clears_a_stale_os_pairing(monkeypatch):
+    import BleLink as module
+    from Links import Target
+    from Protocol import RESULT_UUID
+
+    calls = []
+
+    async def remove_stale_bond(device):
+        calls.append(device)
+        return False
+
+    monkeypatch.setattr(module, "BleakClient", ConnectingClient)
+    monkeypatch.setattr(module.OsBond, "remove_stale_bond", remove_stale_bond)
+    ConnectingClient.made.clear()
+
+    async def run():
+        messages = []
+        link = BleLink(lambda _l, m: messages.append(m), lambda *_: None)
+        await link.connect(Target("ble", "Hydro-ESP1", "AA:BB:CC:DD:EE:FF"))
+        client = ConnectingClient.made[0]
+        assert calls == ["AA:BB:CC:DD:EE:FF"]  # the OS pairing check runs before every connect
+        assert client.kwargs["pair"] is False
+        assert client.kwargs["winrt"] == {"use_cached_services": False}
+        assert client.notifies == [STATE_UUID, TELEMETRY_UUID, RESULT_UUID]
+        assert client.reads == [STATE_UUID]  # no authentication read any more
+        assert link.connected and messages == [{"v": 2, "type": "state"}]
+
+    asyncio.run(run())
+
+
+def test_os_bond_check_never_raises(monkeypatch):
+    import OsBond
+
+    async def broken(_device):
+        raise OSError("no Bluetooth adapter")
+
+    monkeypatch.setattr(OsBond, "_windows_unpair", broken)
+    monkeypatch.setattr(OsBond, "_bluez_remove", broken)
+    assert asyncio.run(OsBond.remove_stale_bond("AA:BB:CC:DD:EE:FF")) is False

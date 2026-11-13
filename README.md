@@ -18,18 +18,23 @@ The desktop app is in [`app/`](app/Readme.md) (Windows `.exe` and Linux
 binary in `app/dist/`, or run from source). It talks contract v2
 ([`app/FirmwareContract.md`](app/FirmwareContract.md)) over **Bluetooth LE only**.
 
-1. Flash `esp32dev` and open the serial monitor (115200). Boot prints
-   `ble: PAIRING PASSKEY nnnnnn` once.
-2. In the app: **Connection** -> **Scan for controllers**, type the passkey,
-   **Connect**. Later connections reuse the bond and need no passkey.
-3. Optional: **Wi-Fi** page -> SSID + password (sent over the bonded link,
+1. Flash `esp32dev`. Boot logs `ble: advertising as Hydro-ESP1 (open link, no pairing)`.
+2. In the app: **Connection** -> **Scan for controllers** -> **Connect**. There is no
+   passkey and no pairing (firmware 0.11.0+).
+3. Optional: **Wi-Fi** page -> SSID + password (sent over the BLE link,
    stored only in the ESP's NVS). The app itself never connects over Wi-Fi.
 4. **Calibration** page when a probe needs it (pH, TDS, light).
 
-**One owner, bond recovery.** The ESP accepts one bonded computer. To move to
-another computer (or after "Forget this controller" in the app), hold **BOOT
-(GPIO0) for 10 s while the firmware is running**, not during reset (that enters
-download mode), then pair again with the new passkey.
+**One computer at a time, no owner.** Any computer can connect, one at a time.
+Disconnect (or close the app) on one computer and the ESP shows up on the next
+one's scan right away. There is no BOOT-button recovery and no reset needed.
+- A computer that just vanished frees the ESP within ~4 s (requested supervision timeout).
+- A connection that never subscribes is dropped after 20 s.
+- A pairing Windows/BlueZ still holds from firmware 0.10 or older is removed by
+  the app before it connects.
+
+**Trade-off:** the link is not encrypted. Anyone in Bluetooth range can read the
+data and send commands, and the Wi-Fi password travels in clear.
 
 ## Pin map (Pin Layout, 22 Oct 2026; architecture §5)
 
@@ -313,6 +318,9 @@ contract-v2 GATT map through `src/transports/ble_gatt.cpp`. That file is the one
 project, because NimBLE-Arduino is a C++ library; it exports a C API (`ble_gatt.h`) and is compiled only
 with `-D FW_ENABLE_BLE`. Production `esp32dev` does not link NimBLE yet.
 
+> History: this spike and its test steps used passkey pairing. Since firmware 0.11.0 the link is open
+> (see "BLE transport" below); the passkey, bonds and BOOT-10 s steps no longer apply.
+
 What the spike does:
 
 - **Advertising and pairing.** Advertises `Hydro-ESP1` with the service UUID. Pairing uses LE Secure
@@ -477,10 +485,24 @@ Every production image (`esp32dev`, `stall_*`, `alarm_latency`) defines `FW_ENAB
 
 The task is "BleTransport" (core 0, priority 2, 6 KB stack), in `src/transports/ble_transport.c` over the C shim `ble_gatt.cpp`.
 
-**Pairing.**
-- LE Secure Connections with bonding and MITM, ESP display-only, one bonded owner.
-- The passkey is drawn inside `bleGattStart()` after NimBLE has started the radio (true RNG), before advertising. It is printed once: `ble: PAIRING PASSKEY nnnnnn`.
-- Holding BOOT for 10 s while running clears all bonds.
+**Link (open since 0.11.0, 12 Nov 2026, written, not flashed).**
+- No pairing, no bonding, no passkey: `setSecurityAuth(false, false, false)`, IO capability none, no `*_AUTHEN` permissions, no Auth gate characteristic. The passkey, the single bonded owner and the BOOT 10 s bond clear are removed.
+- Why: a bond tied the ESP to the first computer. Switching computers needed BOOT 10 s and a reset, the passkey had to be copied from the serial log, and a computer whose bond the ESP had dropped kept failing until the device was removed in Windows Settings.
+- Bonds stored by older firmware are deleted at boot, so NimBLE no longer writes NVS.
+- One client at a time: a second client is disconnected at once (`refused`), and advertising restarts only once the slot is free.
+- After connecting, the ESP requests a 15-30 ms interval and a 4 s supervision timeout, so a vanished client frees the slot quickly.
+- A channel is notified only after the client subscribed to it (so a frame never starts before the app listens). "Ready" = subscribed to State, Telemetry and Result. A client not ready 20 s after connecting is dropped (`idle`).
+- Trade-off: the link is not encrypted; telemetry, commands and `set_wifi` credentials are readable in radio range.
+
+**Pending hardware checks for 0.11.0 (not flashed yet):**
+1. Boot logs `ble: advertising as Hydro-ESP1 (open link, no pairing)`. No passkey line appears.
+2. App on PC X: Scan, then Connect with no passkey. The log shows `client connected and subscribed`, and the first State and Telemetry frames decode with no error.
+3. X disconnects. PC Y sees the ESP at once and connects.
+4. X's laptop vanishes (lid closed, or Bluetooth turned off). Y sees and connects within about 5 s. The supervision request was accepted if this takes about 4 s, not about 20 s.
+5. A Windows PC still paired with 0.10 connects from the app with no step in Windows Settings (the `--log` file shows `removed the old Windows pairing`). Check whether Windows briefly auto-connects in the background first.
+6. A second client is refused: `refused` increases by 1.
+7. nRF Connect connected without subscribing is dropped at 20 s: `idle` increases by 1.
+8. `ble_tear` still resyncs cleanly. App reconnect after the ESP is power-cycled.
 
 **Traffic and priority.**
 - Order of service: commands and their results, then alarm events (from the Safety journal, from link-up on), then State (every 2 s and at link-up; also the readable value), then Telemetry (every 3 s).
@@ -490,15 +512,16 @@ The task is "BleTransport" (core 0, priority 2, 6 KB stack), in `src/transports/
 **Commands.**
 - `get_sensors` is answered here.
 - `get_calibration` and `cal_capture` are answered here too (zero-wait peeks of the applied config and the snapshot).
+- `get_diagnostics` is answered here from the Supervisor's hardware snapshot (see "Hardware diagnostics").
 - `set_sensor_enabled`, `set_wifi`, `forget_wifi`, `set_calibration` and `reset_calibration` go to Configuration; `reset_latch` goes to Safety. (Up to 8.4 also `get_lan_token` / `rotate_lan_token`, removed 28 Oct 2026 with the LAN link.)
 - Up to 8 commands are in flight; more get `busy`.
 - Each request carries the link's session generation and a 5 s expiry, so a reply is never sent on a newer link and a command is never applied late. Reply tags carry a sequence number, so a late reply cannot reach a reused slot.
 
-**Supervision.** A 2 s progress deadline, stack check and task watchdog (the task resets it only for itself). Every 60 s a `ble:` line logs pairing counters, frames, `tlmDrop`, `resDrop`, `busy`, `maxSend` and `notifyFail`.
+**Supervision.** A 2 s progress deadline, stack check and task watchdog (the task resets it only for itself). Every 60 s a `ble:` line logs `ready`, connects, disconnects, `refused`, `idle`, frames, `tlmDrop`, `resDrop`, `busy`, `maxSend` and `notifyFail`.
 
 **Known limits (decided in 8.3):**
-- **Re-pairing deletes the old bond first.** If the bonded computer pairs again, NimBLE-Arduino's default handling deletes its old bond before the new pairing is authenticated. A wrong passkey from that address therefore leaves no bond. Taking over still needs the passkey, so this is a denial-of-service, not a takeover. Changing it would mean patching the pinned library, so it is documented instead.
-- **NimBLE writes its own bond store to NVS** (during pairing only). This is the one documented exception to "Configuration is the only NVS writer", and those writes do not take the flash gate.
+- **No link security (0.11.0).** See "Link" above. Whoever connects first owns the session until they disconnect.
+- **NimBLE bond store.** Since 0.11.0 it is only cleared once at boot, if older firmware left bonds. Nothing is bonded afterwards.
 - **NimBLE host priority.** The host runs on core 0 at priority 21. Safety has been on core 1 since 28 Oct 2026 (D14 with Wi-Fi), so the radios no longer share its core.
 - **Wi-Fi state.** Since 8.4, State reports the real station state (see "Wi-Fi station and LAN link").
 
@@ -718,6 +741,39 @@ Before this date `power_coordinator.c` was a stub: State always reported
   Wire and check the divider first. This also applies to `alarm_latency` and
   the stall test envs. A spurious edge on GPIO8 turns the lamp off for at
   least `POLICY_LAMP_MIN_OFF_MS`: watch for that on the real wiring.
+
+## Hardware diagnostics (30 Oct 2026; written, not flashed)
+
+The app's Dashboard shows a "Controller hardware" section through the
+`get_diagnostics` command (firmware 0.10.0, contract in
+`app/FirmwareContract.md`).
+
+- **Nothing new is measured on request.** Supervisor already computed heap and
+  stack high-water marks every 10 s for its log lines. It now also keeps them
+  in a snapshot, adds PSRAM, NVS usage (every 60 s, read from NVS's RAM page
+  table, never a flash write) and the app partition size (once at boot).
+  BleTransport copies the snapshot into a static view and encodes it into its
+  existing `s_data` buffer (worst case checked < 1536 B by a native test).
+- **CPU load per core** (`diagnostics/cpu_load.c`): FreeRTOS run-time stats are
+  off in the Arduino prebuilt sdkconfig, so each core's idle hook executes the
+  WAITI itself, counts the halted cycles and returns `false` so IDF does not
+  halt again. The cores sleep exactly as before; nothing busy-waits. Supervisor
+  turns the counts into load % every second and keeps a 60 s peak.
+- **Not included:** chip temperature. On IDF 4.4 the ESP32-S3 temperature
+  sensor shares the SAR hardware with the ADC that reads pH, TDS and light, and
+  `temperatureRead()` reconfigures it on every call. Add it only after a bench
+  check that those readings are not disturbed.
+- **No frozen header changed** (`app_config.h` is only read for the task names,
+  cores and stack sizes).
+- **Bench checks to run on the board:** compare the Dashboard heap and stack
+  figures with the serial `sup: stack B ... | heap ...` lines. At rest, the CPU
+  load should be in single digits. To check the load figure itself, run a
+  temporary low-priority task pinned to core 1 that busy-waits 500 ms out of
+  every 1000 ms: core 1 should read about 50 % above its rest value. (The
+  `stall_*` envs block their task, so they do not load the CPU.) Compare the
+  app's power estimate with a USB power meter on the 5 V input, then adjust the
+  two radio assumptions in `app/PowerModel.py` (`BLE_CONNECTED_A`,
+  `WIFI_CONNECTED_A`).
 
 ## DS18B20 bring-up (WP2)
 

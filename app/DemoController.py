@@ -4,8 +4,8 @@ It behaves like the firmware where the UI depends on it: 1 s samples sent in
 3 s telemetry frames, state every 2 s, per-metric health (SGP30 warm-up, pH in
 pH units but UNCALIBRATED on the nominal fit, light in mV until a lux fit),
 sensor enable/disable, a latching over-temperature rule with events, Wi-Fi
-provisioning, on-device calibration (capture / fit / reset) and the WP9 power
-modes. Demo switches move Bluetooth out of range, take Wi-Fi down or pull the
+provisioning, on-device calibration (capture / fit / reset), the WP9 power
+modes and plausible hardware diagnostics (CPU load, heap, stacks). Demo switches move Bluetooth out of range, take Wi-Fi down or pull the
 external 5 V (low-power mode).
 """
 
@@ -33,6 +33,10 @@ BASES = {
     "co2eq": (520.0, 25.0, "ppm"),
 }
 SENSOR_OF = {metric: sensor.key for sensor in SENSORS for metric in sensor.metrics}
+# Firmware task table (include/app_config.h): name, core, stack bytes, typical free minimum.
+DEMO_TASKS = (("Safety", 1, 3072, 1180), ("PowerCoord", 0, 4096, 2210), ("AcqNormal", 1, 4096, 1460),
+              ("AcqLowPower", 0, 4096, 2650), ("WifiMqtt", 0, 6144, 2900), ("BleTransport", 0, 6144, 2480),
+              ("Configuration", 0, 4096, 1920), ("Supervisor", 0, 3072, 1010), ("SerialLogger", 1, 2048, 760))
 OVERHEAT_RULE = 0
 
 
@@ -56,6 +60,8 @@ class DemoController:
         self.latched: set[int] = set()
         self.event_n = 0
         self.readings = {m: {"value": None, "health": "STARTING", "end": None, "seq": 0} for m in BASES}
+        self.heap_min = 171_000
+        self.cpu_peaks = [[], []]
         self.links: set["DemoLink"] = set()
         self.task: asyncio.Task | None = None
 
@@ -239,7 +245,29 @@ class DemoController:
             return {"calibration": {key: dict(value) for key, value in self.calibration.items()}}
         if operation in ("cal_capture", "set_calibration", "reset_calibration"):
             return await self._calibration_command(operation, data)
+        if operation == "get_diagnostics":
+            return self.diagnostics()
         raise RuntimeError("unknown_op")
+
+    def diagnostics(self) -> dict:
+        """Like the firmware's Supervisor snapshot: radios on core 0, acquisition and Safety on core 1."""
+        uptime = self.now_ms()
+        wifi = self.wifi_state == "connected" and self.mode == "normal"
+        busy = len(self.enabled) / len(SENSORS)
+        loads = [round(4 + 2 * busy + (5 if wifi else 0) + random.uniform(0, 3)),
+                 round(2 + 5 * busy + random.uniform(0, 2))]
+        cpu = []
+        for core, load in enumerate(loads):
+            self.cpu_peaks[core] = (self.cpu_peaks[core] + [load])[-6:]  # 60 s at one request per 10 s
+            cpu.append({"load": load, "peak": max(self.cpu_peaks[core]) + (9 if uptime < 20000 else 0)})
+        free = 180_000 - (14_000 if wifi else 0) + random.randint(-1500, 1500)
+        self.heap_min = min(self.heap_min, free - 2000)
+        return {"uptime_ms": uptime, "reset_reason": "POWERON", "cpu_mhz": 240, "cpu": cpu,
+                "heap": {"total": 352_000, "free": free, "min": self.heap_min, "largest": 110_592},
+                "psram": {"total": 8_388_608, "free": 8_351_000},
+                "flash": {"app_partition": 3_342_336, "nvs_used": 47, "nvs_total": 504},
+                "stacks": [{"task": name, "core": core, "size": size, "free_min": free_min}
+                           for name, core, size, free_min in DEMO_TASKS]}
 
     async def _calibration_command(self, operation: str, data: dict) -> dict:
         sensor = data.get("sensor")
@@ -355,7 +383,7 @@ class DemoLink(Link):
         super().__init__(on_message, on_disconnect)
         self.controller = controller
 
-    async def connect(self, target: Target, secret: str = "") -> None:
+    async def connect(self, target: Target) -> None:
         await asyncio.sleep(0.4)
         c = self.controller
         if not c.ble_in_range:
@@ -384,9 +412,6 @@ class DemoLink(Link):
         if not self.connected:
             raise ConnectionError("Connect to the controller over Bluetooth first")
         return await self.controller.command(operation, data)
-
-    async def forget(self, _target: Target) -> None:
-        await self.disconnect()
 
 
 def demo_ble_targets(controller: DemoController) -> list[Target]:

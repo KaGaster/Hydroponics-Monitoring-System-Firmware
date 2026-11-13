@@ -1,4 +1,4 @@
-"""Dashboard: live metric cards, lamp and alarm status, link summary."""
+"""Dashboard: live metric cards, lamp and alarm status, link summary, controller hardware."""
 
 import time
 
@@ -8,9 +8,141 @@ import Theme
 from Catalog import METRICS, format_value, live_health
 from Charts import Sparkline
 from Meter import target_for, unit_label
+from PowerModel import estimate
 from Store import now_ms
 
 SPARK_WINDOW_MS = 10 * 60 * 1000
+CORE_ROLES = ("Core 0 · radios, settings", "Core 1 · Safety, acquisition")
+
+
+def _size(n: int) -> str:
+    return f"{n / 1048576:.1f} MB" if n >= 1048576 else f"{n / 1024:,.0f} kB"
+
+
+def _level(value: float, warn: float, bad: float) -> str:
+    return Theme.BAD if value >= bad else Theme.WARN if value >= warn else Theme.GOOD
+
+
+class HardwarePanel:
+    """Controller hardware: CPU load, RAM, storage (get_diagnostics) and the power estimate."""
+
+    def __init__(self):
+        def big():
+            return ft.Text("—", size=20, weight=ft.FontWeight.BOLD, color=Theme.TEXT)
+
+        def bar():
+            return ft.ProgressBar(value=0, height=8, border_radius=4, bgcolor=Theme.tint(Theme.NEUTRAL, 0.18))
+
+        def figure():
+            return ft.Text("—", size=13, weight=ft.FontWeight.W_600, color=Theme.TEXT)
+
+        def labelled(label, text, line_bar):
+            return [ft.Row([Theme.caption(label), text], alignment=ft.MainAxisAlignment.SPACE_BETWEEN), line_bar]
+        self.status = Theme.caption("")
+        self.cpu_bars = [bar() for _ in CORE_ROLES]
+        self.cpu_texts = [figure() for _ in CORE_ROLES]
+        self.ram, self.ram_bar, self.ram_detail = big(), bar(), Theme.caption("")
+        self.psram_text, self.psram_bar = figure(), bar()
+        self.nvs_text, self.nvs_bar = figure(), bar()
+        self.app_partition = Theme.caption("")
+        self.power, self.power_detail = big(), Theme.caption("")
+
+        cpu_rows = []
+        for role, cpu_bar, text in zip(CORE_ROLES, self.cpu_bars, self.cpu_texts):
+            cpu_rows += labelled(role, text, cpu_bar)
+        storage_rows = (labelled("PSRAM", self.psram_text, self.psram_bar)
+                        + labelled("NVS settings", self.nvs_text, self.nvs_bar) + [self.app_partition])
+        self.control = ft.Column([
+            ft.Row([Theme.title("Controller hardware"), self.status], wrap=True, spacing=14,
+                   vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Row([
+                self._card(ft.Icons.MEMORY_ROUNDED, "CPU load", cpu_rows),
+                self._card(ft.Icons.DEVELOPER_BOARD_ROUNDED, "RAM", [self.ram, self.ram_bar, self.ram_detail]),
+                self._card(ft.Icons.SD_STORAGE_OUTLINED, "Storage", storage_rows),
+                self._card(ft.Icons.BOLT_ROUNDED, "Power (estimate)", [
+                    self.power, self.power_detail,
+                    Theme.caption("Estimated from the power tree, not measured. Excludes battery charging and "
+                                  "the lamp.", 11)]),
+            ], wrap=True, spacing=12, run_spacing=12, vertical_alignment=ft.CrossAxisAlignment.START),
+        ], spacing=12)
+
+    @staticmethod
+    def _card(icon, label, controls) -> ft.Control:
+        return Theme.card([ft.Row([ft.Icon(icon, size=18, color=Theme.MUTED), Theme.overline(label)], spacing=6),
+                           *controls], width=300, padding=16, spacing=8)
+
+    def paint(self, session) -> None:
+        d = session.diagnostics
+        if not session.diagnostics_supported:
+            self.status.value = "This firmware does not report hardware diagnostics (needs 0.10.0 or later)."
+        elif d is None:
+            self.status.value = "Waiting for the controller…" if session.can_command else "Needs Bluetooth"
+        else:
+            age = time.monotonic() - session.diagnostics_at
+            self.status.value = f"Updated {Theme.ago(age)}" + ("" if session.diagnostics_fresh else " · stale")
+        self._cpu(d)
+        self._ram(d)
+        self._storage(d)
+        self._power(session)
+
+    def _cpu(self, d) -> None:
+        cores = d["cpu"] if d else None
+        for i, (cpu_bar, text) in enumerate(zip(self.cpu_bars, self.cpu_texts)):
+            if not cores or i >= len(cores):
+                cpu_bar.value, text.value = 0, "—"
+                continue
+            load, peak = cores[i]["load"], cores[i]["peak"]
+            cpu_bar.value, cpu_bar.color = load / 100, _level(peak, 60, 80)
+            text.value = f"{load} % · peak {peak} %"
+
+    def _ram(self, d) -> None:
+        heap = d["heap"] if d else None
+        if heap is None or not heap["total"]:
+            self.ram.value, self.ram_bar.value, self.ram_detail.value = "—", 0, ""
+            return
+        used = 100 * (heap["total"] - heap["free"]) / heap["total"]
+        self.ram.value = f"{used:.0f} % used"
+        self.ram_bar.value, self.ram_bar.color = used / 100, _level(used, 80, 90)
+        self.ram_detail.value = f"{_size(heap['free'])} free of {_size(heap['total'])}"
+
+    @staticmethod
+    def _fill(line_bar, text, used, total, label) -> None:
+        if not total:
+            line_bar.value, text.value = 0, "—"
+            return
+        pct = 100 * used / total
+        line_bar.value, line_bar.color = pct / 100, _level(pct, 80, 90)
+        text.value = label
+
+    def _storage(self, d) -> None:
+        psram, flash = (d["psram"], d["flash"]) if d else (None, None)
+        if psram:
+            used = psram["total"] - psram["free"]
+            self._fill(self.psram_bar, self.psram_text, used, psram["total"],
+                       f"{_size(used)} of {_size(psram['total'])}")
+        else:
+            self._fill(self.psram_bar, self.psram_text, 0, 0, "")
+        if flash:
+            self._fill(self.nvs_bar, self.nvs_text, flash["nvs_used"], flash["nvs_total"],
+                       f"{flash['nvs_used']} of {flash['nvs_total']} entries")
+            self.app_partition.value = f"App partition {_size(flash['app_partition'])}"
+        else:
+            self._fill(self.nvs_bar, self.nvs_text, 0, 0, "")
+            self.app_partition.value = ""
+
+    def _power(self, session) -> None:
+        if session.state is None:
+            self.power.value, self.power_detail.value = "—", ""
+            return
+        e = estimate(session.state, session.diagnostics, session.connected)
+        self.power.value = f"≈ {e.input_watts:.2f} W"
+        source = {"usb": "USB 5 V supply", "battery": "Battery (LiPo 3S)"}.get(e.source, "Source unknown")
+        detail = f"{source} · {e.input_amps * 1000:,.0f} mA at {e.input_volts:g} V"
+        if e.runtime_h is not None:
+            detail += f"\nAbout {e.runtime_h:.0f} h on a full battery"
+        if not e.cpu_measured:
+            detail += "\nCPU load not reported: assumed"
+        self.power_detail.value = detail
 
 
 class MetricCard:
@@ -88,6 +220,7 @@ class DashboardPage:
         self.recorded_value = ft.Text("", size=20, weight=ft.FontWeight.BOLD, color=Theme.TEXT)
         self.recorded_detail = Theme.caption("")
         self.alarm_banner = ft.Column([], spacing=8)
+        self.hardware = HardwarePanel()
         self.root = None
         self.live = False
         self.last_spark = 0.0
@@ -122,6 +255,7 @@ class DashboardPage:
                     Theme.caption("Bands are indicative, not crop advice. Values update every 3 s.")],
                    wrap=True, spacing=14, vertical_alignment=ft.CrossAxisAlignment.CENTER),
             ft.Row([card.control for card in self.cards.values()], wrap=True, spacing=12, run_spacing=12),
+            self.hardware.control,
         ], spacing=16)
         self.refresh("all")
         return self.root
@@ -163,6 +297,7 @@ class DashboardPage:
         self.recorded_value.value = f"{s.store.count(s.node) if s.node else 0:,}"
         self.recorded_detail.value = "samples for this controller"
         self._alarm_banner(latched, active)
+        self.hardware.paint(s)
 
         enabled = s.enabled
         refresh_spark = time.monotonic() - self.last_spark > 9 or kind == "all"

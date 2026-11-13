@@ -200,6 +200,9 @@ static void test_parse_valid_commands(void) {
   TEST_ASSERT_EQUAL(PROTOCOL_OK, parse("{\"v\":2,\"id\":\"g\",\"op\":\"get_sensors\"}", &c));
   TEST_ASSERT_EQUAL(PROTOCOL_OK, parse("{\"v\":2,\"id\":\"g\",\"op\":\"get_calibration\"}", &c));
   TEST_ASSERT_EQUAL(CMD_OP_GET_CALIBRATION, c.op);
+  TEST_ASSERT_EQUAL(PROTOCOL_OK, parse("{\"v\":2,\"id\":\"d\",\"op\":\"get_diagnostics\",\"data\":{}}", &c));
+  TEST_ASSERT_EQUAL(CMD_OP_GET_DIAGNOSTICS, c.op);
+  TEST_ASSERT_EQUAL_STRING("get_diagnostics", commandOpName(CMD_OP_GET_DIAGNOSTICS));
 }
 
 static void test_parse_calibration_commands(void) {
@@ -269,6 +272,51 @@ static void test_encode_calibration_and_capture(void) {
   TEST_ASSERT_NOT_NULL(strstr(s_out, "\"light\":{\"overridden\":false,\"rev\":0,\"valid\":false"));
   TEST_ASSERT_TRUE(protocolEncodeCapture(SENSOR_PH, 25012, 412, s_out, sizeof(s_out)) > 0);
   TEST_ASSERT_EQUAL_STRING("{\"sensor\":\"ph\",\"x\":25012,\"age_ms\":412}", s_out);
+}
+
+static void test_encode_diagnostics(void) {
+  static DiagnosticsView v;
+  memset(&v, 0, sizeof(v));
+  v.uptimeMs = 734120;
+  v.resetReason = "POWERON";
+  v.cpuMhz = 240;
+  TEST_ASSERT_TRUE(protocolEncodeDiagnostics(&v, s_out, sizeof(s_out)) > 0);
+  TEST_ASSERT_NOT_NULL(strstr(s_out, "\"cpu\":null,\"heap\":null,"));  // not measured yet
+  TEST_ASSERT_NOT_NULL(strstr(s_out, "\"stacks\":[]}"));
+
+  v.cpuValid = true;
+  v.cpuLoad[0] = 7;
+  v.cpuPeak[0] = 19;
+  v.cpuLoad[1] = 12;
+  v.cpuPeak[1] = 31;
+  v.memoryValid = true;
+  v.heapTotal = 327680;
+  v.heapFree = 182340;
+  v.heapMin = 160112;
+  v.heapLargest = 110592;
+  v.taskCount = 1;
+  v.tasks[0] = (DiagnosticsTask){"Safety", 1, 3072, 812};
+  TEST_ASSERT_TRUE(protocolEncodeDiagnostics(&v, s_out, sizeof(s_out)) > 0);
+  TEST_ASSERT_NOT_NULL(strstr(s_out, "{\"uptime_ms\":734120,\"reset_reason\":\"POWERON\",\"cpu_mhz\":240,"));
+  TEST_ASSERT_NOT_NULL(strstr(s_out, "\"cpu\":[{\"load\":7,\"peak\":19},{\"load\":12,\"peak\":31}]"));
+  TEST_ASSERT_NOT_NULL(strstr(s_out, "\"heap\":{\"total\":327680,\"free\":182340,\"min\":160112,\"largest\":110592}"));
+  TEST_ASSERT_NOT_NULL(strstr(s_out, "\"stacks\":[{\"task\":\"Safety\",\"core\":1,\"size\":3072,\"free_min\":812}]}"));
+
+  // Worst case (every number at its maximum, all tasks) fits BleTransport's 1536 B s_data.
+  static const char* kNames[DIAG_TASKS_MAX] = {"Safety", "PowerCoord", "AcqNormal", "AcqLowPower", "WifiMqtt",
+                                               "BleTransport", "Configuration", "Supervisor", "SerialLogger"};
+  v.uptimeMs = UINT64_MAX;
+  v.resetReason = "BROWNOUT";
+  v.cpuMhz = v.heapTotal = v.heapFree = v.heapMin = v.heapLargest = UINT32_MAX;
+  v.psramTotal = v.psramFree = v.appPartition = v.nvsUsed = v.nvsTotal = UINT32_MAX;
+  v.cpuLoad[0] = v.cpuLoad[1] = v.cpuPeak[0] = v.cpuPeak[1] = 100;
+  v.taskCount = DIAG_TASKS_MAX;
+  for (int i = 0; i < DIAG_TASKS_MAX; ++i) v.tasks[i] = (DiagnosticsTask){kNames[i], 1, UINT32_MAX, UINT32_MAX};
+  char small[1536];
+  const size_t len = protocolEncodeDiagnostics(&v, small, sizeof(small));
+  TEST_ASSERT_TRUE(len > 0);
+  TEST_ASSERT_TRUE(len < sizeof(small));
+  TEST_ASSERT_EQUAL(0, protocolEncodeDiagnostics(&v, small, 64));  // overflow reports 0, never a cut frame
 }
 
 static void test_parse_rejects_malformed_and_out_of_range(void) {
@@ -725,6 +773,7 @@ int main(int argc, char** argv) {
   RUN_TEST(test_parse_valid_commands);
   RUN_TEST(test_parse_calibration_commands);
   RUN_TEST(test_encode_calibration_and_capture);
+  RUN_TEST(test_encode_diagnostics);
   RUN_TEST(test_parse_rejects_malformed_and_out_of_range);
   RUN_TEST(test_parse_keeps_id_for_error_reply);
   RUN_TEST(test_blob_defaults_seal_and_corruption);

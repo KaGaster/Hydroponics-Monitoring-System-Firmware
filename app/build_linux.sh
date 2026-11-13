@@ -31,7 +31,7 @@ fi
     --name HydroponicsControl \
     --icon assets/AppIcon.png \
     --add-data "assets:assets" \
-    --hidden-import BleLink DemoController Pairing BluezPairing dbus_fast.aio dbus_fast.service \
+    --hidden-import BleLink DemoController OsBond dbus_fast.aio dbus_fast.service \
     --bundle-id com.appveyor.flet \
     --product-name "Hydroponics Control" \
     --product-version 0.9.0 \

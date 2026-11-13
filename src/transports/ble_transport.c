@@ -34,13 +34,13 @@ void* bleTransportTaskHandle(void) { return 0; }
 #include "services/rail_state.h"
 #include "services/safety.h"
 #include "services/snapshot_store.h"
+#include "services/supervisor.h"
 #include "transports/ble_gatt.h"
 #include "transports/frames.h"
 #include "transports/protocol.h"
 
 #define BLE_NODE_NAME TRANSPORT_NODE_NAME
-#define BLE_BOOT_PIN 0
-#define BLE_BOND_CLEAR_MS 10000u
+#define BLE_IDLE_CLIENT_MS 20000u  // connected but not subscribed after this: dropped
 #define BLE_WAKE_MS 50u
 #define BLE_RX_BYTES 2048
 #define BLE_NOTIFY_RETRIES 40     // x 5 ms: NimBLE buffers free up as packets leave
@@ -66,6 +66,9 @@ static char s_data[1536];
 static TransportScratch s_scratch;
 static ConfigBlob s_cfg;
 static ConfigRequest s_req;  // static: a Wi-Fi password never sits on the stack
+// static: get_diagnostics reports this task's own stack margin
+static SupervisorDiagnostics s_diag;
+static DiagnosticsView s_diagView;
 
 static portMUX_TYPE s_statsMux = portMUX_INITIALIZER_UNLOCKED;
 static BleTransportStats s_stats;
@@ -163,13 +166,13 @@ static bool sendFrame(BleChannel channel, size_t payloadLen, uint32_t generation
   if (channel == BLE_CHANNEL_TELEMETRY && ++s_tearCount % (FW_INJECT_BLE_TEAR) == 0) tear = true;
 #endif
   for (size_t offset = 0; offset < total;) {
-    if (!bleGattSecure() || bleGattGeneration() != generation) return false;  // link gone: nothing to resync
+    if (!bleGattConnected() || bleGattGeneration() != generation) return false;  // link gone: nothing to resync
     size_t chunk = bleGattChunkSize();
     if (chunk > total - offset) chunk = total - offset;
     int tries = 0;
     while ((tear && offset > 0) || !bleGattNotify(channel, &s_frame[offset], chunk)) {
       if (offset == 0 && channel == BLE_CHANNEL_TELEMETRY) return false;
-      if (!bleGattSecure() || bleGattGeneration() != generation) return false;
+      if (!bleGattConnected() || bleGattGeneration() != generation) return false;
       if (++tries >= BLE_NOTIFY_RETRIES) {
         if (offset > 0) {
           s_tornGeneration = generation;
@@ -263,6 +266,43 @@ static void handleCapture(const Command* cmd, uint32_t generation) {
   }
 }
 
+// get_diagnostics: a copy of the Supervisor snapshot, measured nothing here.
+static void handleDiagnostics(const Command* cmd, uint32_t generation) {
+  supervisorGetDiagnostics(&s_diag);
+  DiagnosticsView* v = &s_diagView;
+  memset(v, 0, sizeof(*v));
+  v->uptimeMs = monoNowMs();
+  v->resetReason = s_diag.resetReason;
+  v->cpuMhz = s_diag.cpuMhz;
+  v->cpuValid = s_diag.cpuValid;
+  for (uint8_t c = 0; c < DIAG_CORES && c < CPU_LOAD_CORES; ++c) {
+    v->cpuLoad[c] = s_diag.cpu[c].loadPct;
+    v->cpuPeak[c] = s_diag.cpu[c].peakPct;
+  }
+  v->memoryValid = s_diag.memoryValid;
+  v->heapTotal = s_diag.heapTotal;
+  v->heapFree = s_diag.heapFree;
+  v->heapMin = s_diag.heapMin;
+  v->heapLargest = s_diag.heapLargest;
+  v->psramTotal = s_diag.psramTotal;
+  v->psramFree = s_diag.psramFree;
+  v->appPartition = s_diag.appPartition;
+  v->nvsUsed = s_diag.nvsUsed;
+  v->nvsTotal = s_diag.nvsTotal;
+  for (TaskId id = 0; id < TASK_ID_COUNT && v->taskCount < DIAG_TASKS_MAX; ++id) {
+    if (s_diag.stackFreeMin[id] == 0) continue;  // not created in this build, or not measured yet
+    const TaskSpec* spec = cfgTaskSpec(id);
+    DiagnosticsTask* t = &v->tasks[v->taskCount++];
+    t->name = spec->name;
+    t->core = spec->core;
+    t->stackBytes = spec->stackBytes;
+    t->freeMin = s_diag.stackFreeMin[id];
+  }
+  if (protocolEncodeDiagnostics(v, s_data, sizeof(s_data)) > 0) {
+    sendResultFrame(protocolEncodeResultOk(cmd->id, s_data, payload(), FRAME_MAX_PAYLOAD), generation);
+  }
+}
+
 static void handleCommand(size_t len, uint32_t generation) {
   Command cmd;
   const ProtocolError error = protocolParseCommand(s_command, len, &cmd);
@@ -287,6 +327,10 @@ static void handleCommand(size_t len, uint32_t generation) {
     if (protocolEncodeCalibration(&v, s_data, sizeof(s_data)) > 0) {
       sendResultFrame(protocolEncodeResultOk(cmd.id, s_data, payload(), FRAME_MAX_PAYLOAD), generation);
     }
+    return;
+  }
+  if (cmd.op == CMD_OP_GET_DIAGNOSTICS) {
+    handleDiagnostics(&cmd, generation);
     return;
   }
   if (cmd.op == CMD_OP_CAL_CAPTURE) {
@@ -431,10 +475,10 @@ static void logStats(void) {
   BleTransportStats t;
   bleGattGetStats(&g);
   bleTransportGetStats(&t);
-  logPrintf(LOG_LEVEL_INFO, "ble: secure=%d bonds=%d conn=%lu disc=%lu pair ok=%lu rej=%lu | frames %lu tlmDrop %lu "
+  logPrintf(LOG_LEVEL_INFO, "ble: ready=%d conn=%lu disc=%lu refused=%lu idle=%lu | frames %lu tlmDrop %lu "
             "resDrop %lu busy %lu maxSend %lums notifyFail %lu",
-            bleGattSecure(), bleGattBondCount(), (unsigned long)g.connects, (unsigned long)g.disconnects,
-            (unsigned long)g.pairingsAccepted, (unsigned long)g.pairingsRejected, (unsigned long)t.framesSent,
+            bleGattReady(), (unsigned long)g.connects, (unsigned long)g.disconnects, (unsigned long)g.refused,
+            (unsigned long)g.idleDropped, (unsigned long)t.framesSent,
             (unsigned long)t.telemetryDropped, (unsigned long)t.resultsDropped, (unsigned long)t.busy,
             (unsigned long)t.maxSendMs, (unsigned long)g.notifyFailures);
 }
@@ -443,12 +487,11 @@ static void logStats(void) {
 static void bleTask(void* arg) {
   (void)arg;
   if (esp_task_wdt_add(NULL) != ESP_OK) logPrintf(LOG_LEVEL_ERROR, "ble: task watchdog add failed");
-  logPrintf(LOG_LEVEL_WARN, "ble: PAIRING PASSKEY %06lu (bonded owners: %d)", (unsigned long)bleGattPasskey(),
-            bleGattBondCount());
+  logPrintf(LOG_LEVEL_INFO, "ble: advertising as %s (open link, no pairing)", BLE_NODE_NAME);
 
   uint32_t generation = bleGattGeneration();
-  MonoMs nextState = 0, nextTelemetry = 0, nextStats = monoNowMs() + BLE_STATS_LOG_MS, bootPressedAt = 0;
-  bool wasSecure = false, bondsCleared = false;
+  MonoMs nextState = 0, nextTelemetry = 0, nextStats = monoNowMs() + BLE_STATS_LOG_MS, connectedAt = 0;
+  bool wasReady = false;
   for (;;) {
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(BLE_WAKE_MS));
     const MonoMs now = monoNowMs();
@@ -459,42 +502,39 @@ static void bleTask(void* arg) {
       xStreamBufferReset(s_rx);
       if (s_eventPending) s_eventLost = true;  // never delivered: the next link is told
       s_eventPending = false;
+      connectedAt = now;
     }
     expirePending(generation, now);
-    const bool secure = bleGattSecure();
-    if (secure != wasSecure) {
-      logPrintf(LOG_LEVEL_INFO, "ble: %s", secure ? "owner connected (secure)" : "link closed");
-      wasSecure = secure;
-      if (secure) {
+    const bool ready = bleGattReady();
+    if (ready != wasReady) {
+      logPrintf(LOG_LEVEL_INFO, "ble: %s", ready ? "client connected and subscribed" : "link closed");
+      wasReady = ready;
+      if (ready) {
         nextState = now;  // State at once
         safetyJournalCursorInit(&s_journalCursor);  // events from now on, not history
       }
     }
 
     // Priority: commands and their results, alarm events, State, Telemetry.
-    if (secure) drainRx(generation);
+    if (bleGattConnected()) drainRx(generation);
     drainResults(generation);
-    if (secure) sendEvents(generation);
+    if (ready) sendEvents(generation);
     if (now >= nextState) {
-      publishState(secure, generation);
+      publishState(ready, generation);
       nextState = now + CFG_BLE_STATE_PERIOD_MS;
     }
-    if (secure && now >= nextTelemetry) {
+    if (ready && now >= nextTelemetry) {
       publishTelemetry(generation);
       nextTelemetry = now + CFG_BLE_TELEMETRY_PERIOD_MS;
     }
 
-    // Owner recovery: BOOT held 10 s while running (not at reset: strap pin).
-    if (digitalRead(BLE_BOOT_PIN) == LOW) {
-      if (bootPressedAt == 0) bootPressedAt = now;
-      if (!bondsCleared && now - bootPressedAt >= BLE_BOND_CLEAR_MS) {
-        bleGattClearBonds();
-        logPrintf(LOG_LEVEL_WARN, "ble: BOOT held 10 s - all bonds cleared, pair again with the passkey");
-        bondsCleared = true;
-      }
-    } else {
-      bootPressedAt = 0;
-      bondsCleared = false;
+    // A client that never subscribes (an operating system keeping the link
+    // with no app on it) would hold the only slot: drop it.
+    if (bleGattConnected() && !ready && now - connectedAt >= BLE_IDLE_CLIENT_MS) {
+      logPrintf(LOG_LEVEL_WARN, "ble: client connected %u s without subscribing - dropped",
+                (unsigned)(BLE_IDLE_CLIENT_MS / 1000u));
+      bleGattDropIdle();
+      connectedAt = now;  // once per link: the disconnect bumps the generation
     }
 
     if (now >= nextStats) {
@@ -512,7 +552,6 @@ bool bleTransportInit(void) {
   s_results = xQueueCreateStatic(BLE_PENDING, sizeof(BleResult), s_resultStorage, &s_resultControl);
   if (s_rx == NULL || s_results == NULL) return false;
   frameAssemblerInit(&s_assembler);
-  pinMode(BLE_BOOT_PIN, INPUT_PULLUP);
   if (!bleGattStart(BLE_NODE_NAME, onRx, NULL)) {
     logPrintf(LOG_LEVEL_ERROR, "ble: NimBLE failed to start");
     return false;

@@ -14,9 +14,10 @@
 // an expiry: a reply is never sent on a newer link, a command never applied
 // late.
 //
-// Pairing: LE Secure Connections + bonding + MITM, passkey drawn after the
-// radio starts and printed once on serial; single bonded owner. Holding BOOT
-// (GPIO0) for 10 s while running clears all bonds.
+// Link: open (no pairing, no bonding, no passkey), one client at a time.
+// Data is sent only once the client has subscribed to State, Telemetry and
+// Result; a client still not subscribed 20 s after connecting is dropped so
+// it cannot hold the only slot.
 //
 // Built only with -D FW_ENABLE_BLE (production envs). Without it
 // bleTransportInit() returns false and nothing links NimBLE.

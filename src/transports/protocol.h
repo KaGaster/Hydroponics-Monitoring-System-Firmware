@@ -11,4 +11,4 @@
 #define PROTOCOL_MAX_PAYLOAD_BYTES ((size_t)4096)
 
 // Reported as "fw" in every State frame.
-#define PROTOCOL_FIRMWARE_VERSION "0.9.0"
+#define PROTOCOL_FIRMWARE_VERSION "0.11.0"

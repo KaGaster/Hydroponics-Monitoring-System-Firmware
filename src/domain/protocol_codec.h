@@ -117,6 +117,39 @@ size_t protocolEncodeCalibration(const CalibrationView* v, char* buf, size_t cap
 // {"sensor":"ph","x":<x scaled>,"age_ms":n}
 size_t protocolEncodeCapture(SensorId sensor, int32_t xScaled, uint32_t ageMs, char* buf, size_t cap);
 
+// Hardware diagnostics (get_diagnostics, Dashboard "Controller hardware").
+// Filled by BleTransport from the Supervisor snapshot; null sections mean
+// "not measured yet" (CPU about 2 s, memory about 10 s after boot).
+#define DIAG_CORES 2
+#define DIAG_TASKS_MAX 9
+
+typedef struct DiagnosticsTask {
+  const char* name;
+  uint8_t core;
+  uint32_t stackBytes;
+  uint32_t freeMin;  // stack high-water mark, bytes
+} DiagnosticsTask;
+
+typedef struct DiagnosticsView {
+  MonoMs uptimeMs;
+  const char* resetReason;
+  uint32_t cpuMhz;
+  bool cpuValid;
+  uint8_t cpuLoad[DIAG_CORES], cpuPeak[DIAG_CORES];
+  bool memoryValid;
+  uint32_t heapTotal, heapFree, heapMin, heapLargest;
+  uint32_t psramTotal, psramFree;
+  uint32_t appPartition, nvsUsed, nvsTotal;
+  uint8_t taskCount;
+  DiagnosticsTask tasks[DIAG_TASKS_MAX];
+} DiagnosticsView;
+
+// {"uptime_ms","reset_reason","cpu_mhz","cpu":[{"load","peak"},..]|null,
+//  "heap":{"total","free","min","largest"}|null,"psram":{"total","free"},
+//  "flash":{"app_partition","nvs_used","nvs_total"},
+//  "stacks":[{"task","core","size","free_min"},..]}
+size_t protocolEncodeDiagnostics(const DiagnosticsView* v, char* buf, size_t cap);
+
 // ---------------------------------------------------------------- commands
 
 typedef uint8_t CommandOp;
@@ -130,7 +163,8 @@ enum {
   CMD_OP_GET_CALIBRATION,
   CMD_OP_CAL_CAPTURE,
   CMD_OP_SET_CALIBRATION,
-  CMD_OP_RESET_CALIBRATION
+  CMD_OP_RESET_CALIBRATION,
+  CMD_OP_GET_DIAGNOSTICS
 };
 
 // Calibration commands carry scaled integers (the parser keeps no floats):

@@ -1,13 +1,17 @@
 #include "services/supervisor.h"
 
+#include <esp32-hal-cpu.h>
 #include <esp_heap_caps.h>
+#include <esp_ota_ops.h>
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <nvs.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "app_config.h"
+#include "diagnostics/cpu_load.h"
 #include "diagnostics/logger.h"
 #include "diagnostics/progress.h"
 #include "domain/reading.h"
@@ -24,6 +28,10 @@ static StaticTask_t s_tcb;
 static StackType_t s_stack[3 * 1024];  // cfgTaskSpec(TASK_ID_SUPERVISOR)->stackBytes
 static TaskHandle_t s_task = NULL;
 static Snapshot s_snap;  // static: 584 B does not belong on a 3 KiB stack
+
+// Hardware figures for get_diagnostics; written here, copied by BleTransport.
+static SupervisorDiagnostics s_diag;
+static portMUX_TYPE s_diagLock = portMUX_INITIALIZER_UNLOCKED;
 
 // ---- Progress deadlines (§18) ---------------------------------------------------
 typedef struct Watched {
@@ -138,16 +146,16 @@ static uint32_t stackFree(TaskHandle_t t) {
 }
 
 static void checkMemory(bool report) {
-  const struct { const char* name; TaskHandle_t handle; } tasks[] = {
-      {"safety", safetyTaskHandle()},
-      {"acq", acquisitionNormalTaskHandle()},
-      {"log", (TaskHandle_t)logTaskHandle()},
-      {"sup", s_task},
-      {"cfg", (TaskHandle_t)configurationTaskHandle()},
-      {"ble", (TaskHandle_t)bleTransportTaskHandle()},
-      {"wifi", (TaskHandle_t)wifiMqttTaskHandle()},
-      {"acqlp", acquisitionLowPowerTaskHandle()},
-      {"pwr", (TaskHandle_t)powerCoordinatorTaskHandle()},
+  const struct { const char* name; TaskId id; TaskHandle_t handle; } tasks[] = {
+      {"safety", TASK_ID_SAFETY, safetyTaskHandle()},
+      {"acq", TASK_ID_ACQUISITION_NORMAL, acquisitionNormalTaskHandle()},
+      {"log", TASK_ID_SERIAL_LOGGER, (TaskHandle_t)logTaskHandle()},
+      {"sup", TASK_ID_SUPERVISOR, s_task},
+      {"cfg", TASK_ID_CONFIGURATION, (TaskHandle_t)configurationTaskHandle()},
+      {"ble", TASK_ID_BLE_TRANSPORT, (TaskHandle_t)bleTransportTaskHandle()},
+      {"wifi", TASK_ID_WIFI_MQTT, (TaskHandle_t)wifiMqttTaskHandle()},
+      {"acqlp", TASK_ID_ACQUISITION_LOW_POWER, acquisitionLowPowerTaskHandle()},
+      {"pwr", TASK_ID_POWER_COORDINATOR, (TaskHandle_t)powerCoordinatorTaskHandle()},
   };
   uint32_t freeB[9];
   bool low = false;
@@ -162,6 +170,19 @@ static void checkMemory(bool report) {
   const uint32_t heapMin = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
   const uint32_t largest = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
   const bool heapLow = heapMin < SUPERVISOR_HEAP_WARN_BYTES;
+  const uint32_t heapTotal = (uint32_t)heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
+  const uint32_t psramTotal = (uint32_t)heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+  const uint32_t psramFree = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  taskENTER_CRITICAL(&s_diagLock);
+  for (size_t i = 0; i < 9; ++i) s_diag.stackFreeMin[tasks[i].id] = freeB[i];
+  s_diag.heapTotal = heapTotal;
+  s_diag.heapFree = heapFree;
+  s_diag.heapMin = heapMin;
+  s_diag.heapLargest = largest;
+  s_diag.psramTotal = psramTotal;
+  s_diag.psramFree = psramFree;
+  s_diag.memoryValid = true;
+  taskEXIT_CRITICAL(&s_diagLock);
   if (heapLow) markDegraded("heap");
   if (report || low || heapLow) {
     logPrintf(low || heapLow ? LOG_LEVEL_WARN : LOG_LEVEL_INFO,
@@ -173,6 +194,31 @@ static void checkMemory(bool report) {
     logPrintf(low ? LOG_LEVEL_WARN : LOG_LEVEL_INFO, "sup: stack B acqlp %lu pwr %lu", (unsigned long)freeB[7],
               (unsigned long)freeB[8]);
   }
+}
+
+// ---- Diagnostics snapshot (get_diagnostics) -------------------------------------------
+static void sampleCpu(void) {
+  CpuLoad load[CPU_LOAD_CORES];
+  if (!cpuLoadSample(load)) return;
+  taskENTER_CRITICAL(&s_diagLock);
+  memcpy(s_diag.cpu, load, sizeof(load));
+  s_diag.cpuValid = true;
+  taskEXIT_CRITICAL(&s_diagLock);
+}
+
+static void sampleNvs(void) {
+  nvs_stats_t stats;  // read from NVS's RAM page table; no flash write
+  if (nvs_get_stats(NULL, &stats) != ESP_OK) return;
+  taskENTER_CRITICAL(&s_diagLock);
+  s_diag.nvsUsed = (uint32_t)stats.used_entries;
+  s_diag.nvsTotal = (uint32_t)stats.total_entries;
+  taskEXIT_CRITICAL(&s_diagLock);
+}
+
+void supervisorGetDiagnostics(SupervisorDiagnostics* out) {
+  taskENTER_CRITICAL(&s_diagLock);
+  *out = s_diag;
+  taskEXIT_CRITICAL(&s_diagLock);
 }
 
 // ---- Status line ------------------------------------------------------------------------
@@ -244,7 +290,10 @@ static void printStatus(MonoMs now) {
 
 static void supervisorTask(void* arg) {
   (void)arg;
-  logPrintf(LOG_LEVEL_INFO, "reset reason: %s", resetReasonName(esp_reset_reason()));
+  logPrintf(LOG_LEVEL_INFO, "reset reason: %s", s_diag.resetReason);
+  if (!cpuLoadInit()) logPrintf(LOG_LEVEL_WARN, "sup: CPU load idle hooks not registered");
+  sampleCpu();  // baseline
+  sampleNvs();
   readCounters(&s_prev);
   TickType_t last = xTaskGetTickCount();
   uint32_t seconds = 0;
@@ -254,6 +303,8 @@ static void supervisorTask(void* arg) {
     ++seconds;
     checkProgress(now);
     checkCounters();
+    sampleCpu();
+    if (seconds % SUPERVISOR_NVS_EVERY_S == 0) sampleNvs();
     if (seconds % SUPERVISOR_MEMORY_EVERY_S == 0) {
       checkMemory(seconds % SUPERVISOR_MEMORY_REPORT_EVERY_S == 0);
     }
@@ -265,6 +316,11 @@ static void supervisorTask(void* arg) {
 bool supervisorInit(void) {
   if (s_task != NULL) return true;
   const TaskSpec* spec = cfgTaskSpec(TASK_ID_SUPERVISOR);
+  // Fixed for this boot: set before the task (and any reader) exists.
+  s_diag.resetReason = resetReasonName(esp_reset_reason());
+  s_diag.cpuMhz = getCpuFrequencyMhz();
+  const esp_partition_t* app = esp_ota_get_running_partition();
+  s_diag.appPartition = app != NULL ? (uint32_t)app->size : 0;
   s_task = xTaskCreateStaticPinnedToCore(supervisorTask, spec->name, sizeof(s_stack), NULL,
                                          spec->priority, s_stack, &s_tcb, spec->core);
   return s_task != NULL;

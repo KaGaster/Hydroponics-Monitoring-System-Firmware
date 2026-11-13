@@ -1,6 +1,6 @@
 """Wi-Fi failure-path bench (Stage 8.4): store credentials for a network that does
 not exist, watch the State report 'connecting' / 'failed' with growing retries,
-then forget them. Uses the app's BleLink; the PC must be bonded, the app closed.
+then forget them. Uses the app's BleLink; no pairing needed, the app closed.
 
   $APP/.venv/Scripts/python tools/wifi_fail_bench.py $APP 75
 """
@@ -27,7 +27,7 @@ async def main(seconds: float):
     if not targets:
         raise SystemExit("controller not found")
     link = BleLink(on_message, lambda _l, reason: print("disconnected:", reason))
-    await link.connect(targets[0], "")
+    await link.connect(targets[0])
     print("set_wifi:", await link.send("set_wifi", {"ssid": "NoSuchNet-Bench", "password": "not-a-real-pass"}))
     await asyncio.sleep(seconds)
     print("forget_wifi:", await link.send("forget_wifi", {}))

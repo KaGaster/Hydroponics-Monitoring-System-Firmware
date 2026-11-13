@@ -3,8 +3,8 @@ import struct
 
 import pytest
 
-from Protocol import (POWER_MODES, Decoder, encode, parse_calibration, parse_event, parse_state, parse_telemetry,
-                      request)
+from Protocol import (POWER_MODES, Decoder, encode, parse_calibration, parse_diagnostics, parse_event, parse_state,
+                      parse_telemetry, request)
 
 
 def frame(obj) -> bytes:
@@ -79,7 +79,7 @@ def test_lan_ops_are_gone_and_calibration_ops_exist():
     for op in ("get_lan_token", "rotate_lan_token", "hello"):
         with pytest.raises(ValueError):
             request(op, {})
-    for op in ("get_calibration", "cal_capture", "set_calibration", "reset_calibration"):
+    for op in ("get_calibration", "cal_capture", "set_calibration", "reset_calibration", "get_diagnostics"):
         assert request(op, {})["op"] == op
 
 
@@ -101,3 +101,45 @@ def test_parse_calibration_skips_malformed_entries():
     assert table["ph"] == {"overridden": True, "rev": 7, "valid": True, "slope": -0.0057, "offset": 22.7}
     with pytest.raises(ValueError):
         parse_calibration({})
+
+
+DIAGNOSTICS = {"uptime_ms": 734120, "reset_reason": "POWERON", "cpu_mhz": 240,
+               "cpu": [{"load": 7, "peak": 19}, {"load": 12, "peak": 31}],
+               "heap": {"total": 327680, "free": 182340, "min": 160112, "largest": 110592},
+               "psram": {"total": 8388608, "free": 8350000},
+               "flash": {"app_partition": 3145728, "nvs_used": 42, "nvs_total": 504},
+               "stacks": [{"task": "Safety", "core": 1, "size": 3072, "free_min": 812}]}
+
+
+def test_parse_diagnostics_keeps_valid_fields():
+    d = parse_diagnostics(DIAGNOSTICS)
+    assert d["uptime_ms"] == 734120 and d["reset_reason"] == "POWERON" and d["cpu_mhz"] == 240
+    assert d["cpu"] == [{"load": 7, "peak": 19}, {"load": 12, "peak": 31}]
+    assert d["heap"]["min"] == 160112 and d["psram"]["total"] == 8388608 and d["flash"]["nvs_used"] == 42
+    assert d["stacks"] == [{"task": "Safety", "core": 1, "size": 3072, "free_min": 812}]
+
+
+def test_parse_diagnostics_drops_malformed_sections():
+    bad = {**DIAGNOSTICS,
+           "cpu": [{"load": 140, "peak": 150}, {"load": 3, "peak": 4}],     # over 100 %
+           "heap": {"total": 1000, "free": 2000, "min": 10, "largest": 10},  # more free than total
+           "psram": {"total": -1, "free": 0},
+           "flash": {"app_partition": "big"},
+           "stacks": [{"task": "Safety", "core": 1, "size": 3072, "free_min": 9999},  # clamped to the size
+                      {"task": "Ghost", "core": 7, "size": 1, "free_min": 0},        # no such core
+                      {"core": 0, "size": 1024, "free_min": 10},                    # no name
+                      "junk"],
+           "reset_reason": None}
+    d = parse_diagnostics(bad)
+    assert d["cpu"] is None and d["heap"] is None and d["psram"] is None and d["flash"] is None
+    assert d["stacks"] == [{"task": "Safety", "core": 1, "size": 3072, "free_min": 3072}]
+    assert d["reset_reason"] == "UNKNOWN"
+
+
+def test_parse_diagnostics_before_the_first_measurement():
+    d = parse_diagnostics({"uptime_ms": 900, "reset_reason": "SW", "cpu_mhz": 240, "cpu": None, "heap": None,
+                           "psram": {"total": 0, "free": 0},
+                           "flash": {"app_partition": 0, "nvs_used": 0, "nvs_total": 0}, "stacks": []})
+    assert d["cpu"] is None and d["heap"] is None and d["stacks"] == []
+    with pytest.raises(ValueError):
+        parse_diagnostics(["not", "a", "dict"])

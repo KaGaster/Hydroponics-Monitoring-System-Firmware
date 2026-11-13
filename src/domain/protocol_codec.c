@@ -404,6 +404,71 @@ size_t protocolEncodeCapture(SensorId sensor, int32_t xScaled, uint32_t ageMs, c
   return jsonWriterLength(&w);
 }
 
+static void encodeKeyU32(JsonWriter* w, const char* key, uint32_t v, bool comma) {
+  if (comma) jsonRaw(w, ",");
+  jsonKey(w, key);
+  jsonU32(w, v);
+}
+
+size_t protocolEncodeDiagnostics(const DiagnosticsView* v, char* buf, size_t cap) {
+  JsonWriter w;
+  jsonWriterInit(&w, buf, cap);
+  jsonRaw(&w, "{");
+  jsonKey(&w, "uptime_ms");
+  jsonU64(&w, v->uptimeMs);
+  jsonRaw(&w, ",");
+  jsonKey(&w, "reset_reason");
+  jsonString(&w, v->resetReason != NULL ? v->resetReason : "UNKNOWN");
+  encodeKeyU32(&w, "cpu_mhz", v->cpuMhz, true);
+  jsonRaw(&w, ",\"cpu\":");
+  if (v->cpuValid) {
+    jsonRaw(&w, "[");
+    for (uint8_t c = 0; c < DIAG_CORES; ++c) {
+      if (c > 0) jsonRaw(&w, ",");
+      jsonRaw(&w, "{");
+      encodeKeyU32(&w, "load", v->cpuLoad[c], false);
+      encodeKeyU32(&w, "peak", v->cpuPeak[c], true);
+      jsonRaw(&w, "}");
+    }
+    jsonRaw(&w, "]");
+  } else {
+    jsonRaw(&w, "null");
+  }
+  jsonRaw(&w, ",\"heap\":");
+  if (v->memoryValid) {
+    jsonRaw(&w, "{");
+    encodeKeyU32(&w, "total", v->heapTotal, false);
+    encodeKeyU32(&w, "free", v->heapFree, true);
+    encodeKeyU32(&w, "min", v->heapMin, true);
+    encodeKeyU32(&w, "largest", v->heapLargest, true);
+    jsonRaw(&w, "}");
+  } else {
+    jsonRaw(&w, "null");
+  }
+  jsonRaw(&w, ",\"psram\":{");
+  encodeKeyU32(&w, "total", v->psramTotal, false);
+  encodeKeyU32(&w, "free", v->psramFree, true);
+  jsonRaw(&w, "},\"flash\":{");
+  encodeKeyU32(&w, "app_partition", v->appPartition, false);
+  encodeKeyU32(&w, "nvs_used", v->nvsUsed, true);
+  encodeKeyU32(&w, "nvs_total", v->nvsTotal, true);
+  jsonRaw(&w, "},\"stacks\":[");
+  const uint8_t n = v->taskCount < DIAG_TASKS_MAX ? v->taskCount : DIAG_TASKS_MAX;
+  for (uint8_t i = 0; i < n; ++i) {
+    const DiagnosticsTask* t = &v->tasks[i];
+    if (i > 0) jsonRaw(&w, ",");
+    jsonRaw(&w, "{");
+    jsonKey(&w, "task");
+    jsonString(&w, t->name != NULL ? t->name : "?");
+    encodeKeyU32(&w, "core", t->core, true);
+    encodeKeyU32(&w, "size", t->stackBytes, true);
+    encodeKeyU32(&w, "free_min", t->freeMin, true);
+    jsonRaw(&w, "}");
+  }
+  jsonRaw(&w, "]}");
+  return jsonWriterLength(&w);
+}
+
 // ================================================================ parser
 
 #define FIELD_KEY_MAX 15
@@ -700,6 +765,7 @@ static const OpName kOps[] = {
     {"cal_capture", CMD_OP_CAL_CAPTURE},
     {"set_calibration", CMD_OP_SET_CALIBRATION},
     {"reset_calibration", CMD_OP_RESET_CALIBRATION},
+    {"get_diagnostics", CMD_OP_GET_DIAGNOSTICS},
 };
 
 const char* commandOpName(CommandOp op) {
@@ -760,6 +826,7 @@ static ProtocolError validateData(const Field* data, uint8_t count, bool haveDat
     case CMD_OP_GET_SENSORS:
     case CMD_OP_FORGET_WIFI:
     case CMD_OP_GET_CALIBRATION:
+    case CMD_OP_GET_DIAGNOSTICS:
       return PROTOCOL_OK;  // data ignored
     default: break;
   }

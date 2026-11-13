@@ -1,21 +1,25 @@
 """Bleak transport for the Hydroponics GATT service (contract v2).
 
-Pairing is platform specific (BlueZ agent on Linux, WinRT custom pairing on
-Windows, see Pairing.py); after pairing, everything here is the same on
-every platform. State, Telemetry and Result notifications stay subscribed for
-the whole connection, so readings are recorded whatever page is open.
+The link is open (firmware 0.11.0 and later): no passkey, no pairing, the
+same code on every platform. A pairing left over from older firmware is
+removed first (OsBond.py), so the OS never tries to encrypt with a dead key.
+State, Telemetry and Result notifications stay subscribed for the whole
+connection, so readings are recorded whatever page is open.
 """
 
 import asyncio
+import logging
+import sys
 
 from bleak import BleakClient, BleakScanner
 
-import Pairing
+import OsBond
 from Links import Link, Target
 from Protocol import (
-    AUTH_UUID, AUTH_VALUE, COMMAND_UUID, RESULT_UUID, SERVICE_UUID, STATE_UUID, TELEMETRY_UUID,
-    Decoder, encode, request,
+    COMMAND_UUID, RESULT_UUID, SERVICE_UUID, STATE_UUID, TELEMETRY_UUID, Decoder, encode, request,
 )
+
+log = logging.getLogger("session.ble")
 
 NOTIFY_UUIDS = (STATE_UUID, TELEMETRY_UUID, RESULT_UUID)
 
@@ -42,22 +46,25 @@ class BleLink(Link):
         self.pending: dict[str, asyncio.Future] = {}
         self.write_lock = asyncio.Lock()
 
-    async def connect(self, target: Target, secret: str = "") -> None:
-        """secret is the six-digit passkey, needed only for the first pairing."""
+    async def connect(self, target: Target) -> None:
         await self.disconnect()
-        await Pairing.pair_controller(target.device or target.address, secret)
-        client = BleakClient(target.device or target.address, pair=False, timeout=60,
+        device = target.device or target.address
+        if await OsBond.remove_stale_bond(device) and sys.platform.startswith("linux"):
+            # BlueZ dropped the device object with its pairing: find it again.
+            device = await BleakScanner.find_device_by_address(target.address, timeout=8.0)
+            if device is None:
+                raise ConnectionError("The controller is no longer in range. Scan again with the ESP nearby.")
+        # Uncached services: Windows may hold the GATT table of an older firmware
+        # at this address (it had other characteristics and permissions).
+        client = BleakClient(device, pair=False, timeout=30, winrt={"use_cached_services": False},
                              disconnected_callback=lambda c: self._disconnected(c))
         try:
             await client.connect()
             self._clear_decoders()
             self.listening = client
-            for uuid in (AUTH_UUID, COMMAND_UUID, *NOTIFY_UUIDS):
+            for uuid in (COMMAND_UUID, *NOTIFY_UUIDS):
                 if client.services.get_characteristic(uuid) is None:
                     raise RuntimeError(f"Controller is missing GATT characteristic {uuid}")
-            # The firmware requires an encrypted, MITM-authenticated link for this read.
-            if bytes(await client.read_gatt_char(AUTH_UUID)) != AUTH_VALUE:
-                raise RuntimeError("Controller authentication check failed")
             for uuid in NOTIFY_UUIDS:
                 await client.start_notify(
                     uuid, lambda _char, data, key=uuid, owner=client: self._notification(owner, key, data))
@@ -73,10 +80,12 @@ class BleLink(Link):
                 await client.disconnect()
             except Exception:
                 pass
-            if "failed to discover services" in str(error).lower() or "authenticat" in str(error).lower():
+            log.info("connect to %s failed: %s: %s", target.address, type(error).__name__, error)
+            text = str(error).lower()
+            if any(word in text for word in ("authenticat", "encrypt", "insufficient")):
                 raise ConnectionError(
-                    "The controller refused the secure connection. If this computer was paired before the "
-                    "controller's bond was cleared, choose Forget device and pair again with a new passkey."
+                    "The controller asks for a secure link: it runs firmware older than 0.11.0. "
+                    "Flash the current firmware, then connect again."
                 ) from error
             raise
 
@@ -91,7 +100,7 @@ class BleLink(Link):
     @staticmethod
     async def _close(client: BleakClient | None) -> None:
         """Always close, even after a link loss: on Windows the GATT session keeps
-        "maintaining" the bonded connection until it is closed, so the controller
+        "maintaining" the connection until it is closed, so the controller
         stays held by a dead client and every new connection fails."""
         if client is None:
             return
@@ -168,7 +177,3 @@ class BleLink(Link):
             return result.get("data", {}) if isinstance(result.get("data"), dict) else {}
         finally:
             self.pending.pop(message["id"], None)
-
-    async def forget(self, target: Target) -> None:
-        await self.disconnect()
-        await Pairing.forget_controller(target.device or target.address)

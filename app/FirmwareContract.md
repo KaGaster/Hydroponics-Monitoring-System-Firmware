@@ -1,6 +1,6 @@
 # ESP32 contract, version 2
 
-Version 2 is implemented by the production firmware (the repository root, one level up from `app/`, `PROTOCOL_FIRMWARE_VERSION` 0.9.0: WP8 and WP9). It replaces [version 1](FirmwareContract-v1.md), which only the simulated [ESP demo](ESP-Demo/BuildGuide.md) implements. Firmware and app change together: any field change here must be mirrored in `src/domain/protocol_codec.*`, `Protocol.py`, `Catalog.py` and `DemoController.py`.
+Version 2 is implemented by the production firmware (the repository root, one level up from `app/`, `PROTOCOL_FIRMWARE_VERSION` 0.10.0: WP8, WP9 and hardware diagnostics). It replaces [version 1](FirmwareContract-v1.md), which only the simulated [ESP demo](ESP-Demo/BuildGuide.md) implements. Firmware and app change together: any field change here must be mirrored in `src/domain/protocol_codec.*`, `Protocol.py`, `Catalog.py` and `DemoController.py`.
 
 **Bluetooth LE is the only link** between the app and the controller: it carries State, Telemetry, events and commands. The controller's Wi-Fi is a setting (`set_wifi` / `forget_wifi`) kept for future server publishing; the app never connects over it. The read-only LAN link of Stage 8.4 (TCP 47800, mDNS, `hello` token, `get_lan_token`, `rotate_lan_token`) was removed: those operations now get `unknown_op`.
 
@@ -17,18 +17,28 @@ Each message is UTF-8 JSON preceded by a two-byte little-endian payload length.
 | Purpose | UUID | Access |
 | --- | --- | --- |
 | Hydroponics service | 98a90f00-346e-4e65-9cbd-7687685bdc01 | Advertised |
-| State | 98a90f01-346e-4e65-9cbd-7687685bdc01 | Authenticated read and notify |
-| Telemetry | 98a90f02-346e-4e65-9cbd-7687685bdc01 | Authenticated notify |
-| Command | 98a90f03-346e-4e65-9cbd-7687685bdc01 | Authenticated write with response |
-| Result | 98a90f04-346e-4e65-9cbd-7687685bdc01 | Authenticated notify (results and events) |
-| Auth gate | 98a90f05-346e-4e65-9cbd-7687685bdc01 | Authenticated read, value `HYDRO_SECURE_V1` |
+| State | 98a90f01-346e-4e65-9cbd-7687685bdc01 | Read and notify |
+| Telemetry | 98a90f02-346e-4e65-9cbd-7687685bdc01 | Notify |
+| Command | 98a90f03-346e-4e65-9cbd-7687685bdc01 | Write with response |
+| Result | 98a90f04-346e-4e65-9cbd-7687685bdc01 | Notify (results and events) |
 
-**Security:**
+The Auth gate characteristic (…0f05, `HYDRO_SECURE_V1`) of firmware 0.10 and earlier is gone.
 
-- The firmware uses LE Secure Connections with bonding and MITM protection, and its IO capability is display-only.
-- At boot it generates a six-digit passkey and prints it once on the local serial log. The app asks the user for this passkey and supplies it on every platform: through the BlueZ agent on Linux and through WinRT custom pairing on Windows.
-- Only one bonded owner is accepted. Another device is refused while a bond exists.
-- **Bond recovery:** hold the BOOT button for 10 s while the firmware is running. Holding it through reset does not work, because GPIO0 is a strap pin and the chip enters download mode instead.
+**Link (firmware 0.11.0 and later):**
+
+- Open link: no pairing, no bonding, no passkey, no BOOT-button recovery. Any computer in range can connect.
+  Bonds left in NVS by older firmware are deleted at boot.
+- One client at a time. A second client is disconnected at once, and the ESP does not advertise while a
+  client is connected.
+- The ESP asks for a 4 s supervision timeout after connecting, so a computer that vanishes frees the
+  controller within about 4 s (the central may refuse the request).
+- Data is notified on a characteristic only after the client subscribes to it. A client that has not
+  subscribed to State, Telemetry and Result 20 s after connecting is dropped, so an OS-level connection
+  with no app on it cannot hold the only slot.
+- The app removes a pairing the OS still holds from older firmware (WinRT on Windows, BlueZ on Linux)
+  before every connection, and reads services uncached on Windows.
+- **Trade-off:** the link is not encrypted. Anyone in radio range can read telemetry and send commands,
+  including `set_wifi`, whose SSID and password then travel in clear.
 
 **Traffic:**
 
@@ -121,6 +131,7 @@ The `id` is at most 40 characters. Each command gets exactly one Result frame wi
 | `cal_capture` | `{"sensor"}` | `{"sensor","x","age_ms"}`: the sensor's raw input now, scaled (below) |
 | `set_calibration` | `{"sensor","x1","y1"[,"x2","y2"]}` | `{"applied":true,"cfg_rev":n}` |
 | `reset_calibration` | `{"sensor"}` | `{"applied":true,"cfg_rev":n}` |
+| `get_diagnostics` | `{}` | Hardware snapshot (see Hardware diagnostics). Since 0.10.0; older firmware answers `unknown_op`. |
 
 **Calibration** (Calibration page). Only `ph`, `tds` and `light` take one; any other sensor gets `bad_field`. Numbers are scaled integers (the parser keeps no fractions):
 
@@ -157,3 +168,27 @@ Alarm events come from a 64-entry journal. They are sent on the Result character
 
 - `n` increases by one for each event.
 - `gap:true` means some older events were lost: the journal overflowed, or an event could not be sent before the previous Bluetooth link closed. An event that fails to send on a live link stays queued and is sent again.
+
+## Hardware diagnostics
+
+`get_diagnostics` returns a copy of the Supervisor's latest hardware figures. The command measures nothing itself, and is answered at once (no queue, never `busy`). The app asks every 10 s, and only while the Dashboard is open.
+
+~~~json
+{"uptime_ms":734120,"reset_reason":"POWERON","cpu_mhz":240,
+ "cpu":[{"load":7,"peak":19},{"load":12,"peak":31}],
+ "heap":{"total":327680,"free":182340,"min":160112,"largest":110592},
+ "psram":{"total":8388608,"free":8350000},
+ "flash":{"app_partition":3342336,"nvs_used":47,"nvs_total":504},
+ "stacks":[{"task":"Safety","core":1,"size":3072,"free_min":812},"..."]}
+~~~
+
+| Field | Meaning |
+| --- | --- |
+| `reset_reason` | Cause of the last reset: `POWERON`, `SW`, `PANIC`, `INT_WDT`, `TASK_WDT`, `WDT`, `BROWNOUT`, `DEEPSLEEP`, `EXT`, `SDIO` or `UNKNOWN`. |
+| `cpu` | Per core (index = core): load % over the last second, and the highest load in the last 60 s. `null` for about 2 s after boot. Measured from the time each core's idle task spends halted (WAITI), because FreeRTOS run-time stats are off in the Arduino build. Interrupt time counts as busy. |
+| `heap` | Internal RAM in bytes: total, free now, lowest free since boot, largest free block. `null` until the first 10 s memory check. |
+| `psram` | External PSRAM in bytes; `0` / `0` without PSRAM. |
+| `flash` | Running app partition size in bytes; NVS entries used / total (32 B each), read every 60 s. |
+| `stacks` | One entry per created task: name and core from the task table (`app_config.h`), stack size and the high-water mark `free_min` in bytes, refreshed every 10 s. |
+
+There is no supply voltage or current field: nothing on the board measures them. The app estimates power from the power tree and this data (`PowerModel.py`).

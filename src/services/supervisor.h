@@ -12,8 +12,17 @@
 //   every 5 s   status line: readings, lamp, counters, "health OK" or
 //               "DEGRADED <first cause>" for the last 5 s
 //   boot        reset reason (a TASK_WDT here means a watched task stalled)
+//
+// It also keeps the latest hardware figures for the app (get_diagnostics):
+// CPU load per core (every 1 s), heap, PSRAM and stacks (every 10 s), NVS
+// usage (every 60 s). The command only copies this snapshot: it never
+// measures anything itself.
 #pragma once
 #include <stdbool.h>
+#include <stdint.h>
+
+#include "app_config.h"
+#include "diagnostics/cpu_load.h"
 
 #define SUPERVISOR_STATUS_EVERY_S 5
 #define SUPERVISOR_MEMORY_EVERY_S 10
@@ -38,4 +47,20 @@
 #define SUPERVISOR_STACK_WARN_BYTES 512u  // §16: keep >= 25 % headroom; warn below this
 #define SUPERVISOR_HEAP_WARN_BYTES 20000u // internal heap minimum ever
 
+#define SUPERVISOR_NVS_EVERY_S 60
+
+typedef struct SupervisorDiagnostics {
+  bool cpuValid;                  // false until two CPU samples exist (about 2 s after boot)
+  bool memoryValid;               // false until the first 10 s memory check
+  CpuLoad cpu[CPU_LOAD_CORES];
+  uint32_t cpuMhz;
+  const char* resetReason;        // static string, e.g. "POWERON"
+  uint32_t heapTotal, heapFree, heapMin, heapLargest;  // internal RAM, bytes
+  uint32_t psramTotal, psramFree;                     // 0 / 0 without PSRAM
+  uint32_t appPartition;          // running app partition size, bytes
+  uint32_t nvsUsed, nvsTotal;     // NVS entries (32 B each)
+  uint32_t stackFreeMin[TASK_ID_COUNT];  // high-water mark in bytes, 0 = task not created
+} SupervisorDiagnostics;
+
 bool supervisorInit(void);
+void supervisorGetDiagnostics(SupervisorDiagnostics* out);  // zero-wait copy, any task
