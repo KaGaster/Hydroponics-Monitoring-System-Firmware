@@ -191,4 +191,4 @@ Alarm events come from a 64-entry journal. They are sent on the Result character
 | `flash` | Running app partition size in bytes; NVS entries used / total (32 B each), read every 60 s. |
 | `stacks` | One entry per created task: name and core from the task table (`app_config.h`), stack size and the high-water mark `free_min` in bytes, refreshed every 10 s. |
 
-There is no supply voltage or current field: nothing on the board measures them. The app estimates power from the power tree and this data (`PowerModel.py`).
+There is no supply voltage or current field: nothing on the board measures them. A `BROWNOUT` reset reason is the only supply symptom the board reports.

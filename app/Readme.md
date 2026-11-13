@@ -18,8 +18,8 @@ simulator; no hardware is needed.
   - Summary cards show the Bluetooth link, the power mode, the grow lamp (on/off and why), alarms and the
     number of samples recorded.
   - **Controller hardware** (firmware 0.10.0+, `get_diagnostics` every 10 s while the Dashboard is open):
-    CPU load per core with a 60 s peak, RAM use, storage (PSRAM, NVS entries, app partition), and a power
-    estimate (`PowerModel.py`: power tree + measured CPU load; not a measurement).
+    uptime and the cause of the last restart (a brownout or crash is shown in red), CPU load per core with a
+    60 s peak, RAM use and storage (PSRAM, NVS entries, app partition).
   - A latched alarm shows a banner with **Reset**. The reset is refused while the condition persists.
 - **Connection**: Bluetooth scan, then **Connect**: no passkey, no pairing. Automatic reconnect after a
   link loss, and Disconnect.
@@ -173,7 +173,6 @@ commands. That includes the Wi-Fi password sent from the Wi-Fi page, which trave
 | `BleLink.py`, `Links.py` | Bluetooth (bleak) link |
 | `OsBond.py` | Removes an OS pairing left by firmware 0.10 or older (WinRT / BlueZ) |
 | `Protocol.py`, `Catalog.py`, `Meter.py` | Contract v2 framing and validation; metric labels; display bands |
-| `PowerModel.py` | Power estimate from the power tree and the ESP32-S3 datasheet |
 | `Store.py`, `Export.py` | SQLite history; CSV and JSON export |
 | `DemoController.py` | v2 simulator for `--demo` |
 | `assets/`, `tools/make_icon.py` | App icons and the script that makes them |

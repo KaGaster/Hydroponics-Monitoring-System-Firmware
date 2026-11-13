@@ -8,11 +8,35 @@ import Theme
 from Catalog import METRICS, format_value, live_health
 from Charts import Sparkline
 from Meter import target_for, unit_label
-from PowerModel import estimate
 from Store import now_ms
 
 SPARK_WINDOW_MS = 10 * 60 * 1000
 CORE_ROLES = ("Core 0 · radios, settings", "Core 1 · Safety, acquisition")
+# Firmware reset_reason (supervisor.c resetReasonName) -> plain words, colour.
+RESET_REASONS = {
+    "POWERON": ("Power on or reset button", Theme.GOOD),
+    "EXT": ("Reset pin", Theme.GOOD),
+    "SW": ("Software restart", Theme.GOOD),
+    "DEEPSLEEP": ("Woke from deep sleep", Theme.GOOD),
+    "BROWNOUT": ("Brownout: supply voltage dropped", Theme.BAD),
+    "PANIC": ("Firmware crash", Theme.BAD),
+    "INT_WDT": ("Watchdog (interrupt)", Theme.BAD),
+    "TASK_WDT": ("Watchdog (task stalled)", Theme.BAD),
+    "WDT": ("Watchdog", Theme.BAD),
+    "SDIO": ("SDIO reset", Theme.WARN),
+}
+
+
+def _duration(ms: int) -> str:
+    s = max(0, int(ms // 1000))
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if d:
+        return f"{d} d {h} h"
+    if h:
+        return f"{h} h {m:02d} min"
+    return f"{m} min {s:02d} s" if m else f"{s} s"
 
 
 def _size(n: int) -> str:
@@ -24,7 +48,7 @@ def _level(value: float, warn: float, bad: float) -> str:
 
 
 class HardwarePanel:
-    """Controller hardware: CPU load, RAM, storage (get_diagnostics) and the power estimate."""
+    """Controller hardware: CPU load, RAM, storage, uptime and last restart (get_diagnostics)."""
 
     def __init__(self):
         def big():
@@ -45,7 +69,9 @@ class HardwarePanel:
         self.psram_text, self.psram_bar = figure(), bar()
         self.nvs_text, self.nvs_bar = figure(), bar()
         self.app_partition = Theme.caption("")
-        self.power, self.power_detail = big(), Theme.caption("")
+        self.uptime = big()
+        self.reset_text = ft.Text("—", size=13, weight=ft.FontWeight.W_600, color=Theme.TEXT)
+        self.reset_dot = ft.Icon(ft.Icons.CIRCLE, size=10, color=Theme.MUTED)
 
         cpu_rows = []
         for role, cpu_bar, text in zip(CORE_ROLES, self.cpu_bars, self.cpu_texts):
@@ -56,13 +82,13 @@ class HardwarePanel:
             ft.Row([Theme.title("Controller hardware"), self.status], wrap=True, spacing=14,
                    vertical_alignment=ft.CrossAxisAlignment.CENTER),
             ft.Row([
+                self._card(ft.Icons.TIMER_OUTLINED, "Uptime", [
+                    self.uptime, Theme.caption("Last restart"),
+                    ft.Row([self.reset_dot, self.reset_text], spacing=6,
+                           vertical_alignment=ft.CrossAxisAlignment.CENTER)]),
                 self._card(ft.Icons.MEMORY_ROUNDED, "CPU load", cpu_rows),
                 self._card(ft.Icons.DEVELOPER_BOARD_ROUNDED, "RAM", [self.ram, self.ram_bar, self.ram_detail]),
                 self._card(ft.Icons.SD_STORAGE_OUTLINED, "Storage", storage_rows),
-                self._card(ft.Icons.BOLT_ROUNDED, "Power (estimate)", [
-                    self.power, self.power_detail,
-                    Theme.caption("Estimated from the power tree, not measured. Excludes battery charging and "
-                                  "the lamp.", 11)]),
             ], wrap=True, spacing=12, run_spacing=12, vertical_alignment=ft.CrossAxisAlignment.START),
         ], spacing=12)
 
@@ -80,10 +106,22 @@ class HardwarePanel:
         else:
             age = time.monotonic() - session.diagnostics_at
             self.status.value = f"Updated {Theme.ago(age)}" + ("" if session.diagnostics_fresh else " · stale")
+        self._uptime(session, d)
         self._cpu(d)
         self._ram(d)
         self._storage(d)
-        self._power(session)
+
+    def _uptime(self, session, d) -> None:
+        if not d:
+            self.uptime.value, self.reset_text.value, self.reset_dot.color = "—", "—", Theme.MUTED
+            return
+        # Count on from the last report so the figure moves between polls.
+        live = d["uptime_ms"] + (time.monotonic() - session.diagnostics_at) * 1000 if session.connected else \
+            d["uptime_ms"]
+        self.uptime.value = _duration(live)
+        reason = d["reset_reason"]
+        text, colour = RESET_REASONS.get(reason, (f"Unknown ({reason})", Theme.WARN))
+        self.reset_text.value, self.reset_dot.color = text, colour
 
     def _cpu(self, d) -> None:
         cores = d["cpu"] if d else None
@@ -129,20 +167,6 @@ class HardwarePanel:
         else:
             self._fill(self.nvs_bar, self.nvs_text, 0, 0, "")
             self.app_partition.value = ""
-
-    def _power(self, session) -> None:
-        if session.state is None:
-            self.power.value, self.power_detail.value = "—", ""
-            return
-        e = estimate(session.state, session.diagnostics, session.connected)
-        self.power.value = f"≈ {e.input_watts:.2f} W"
-        source = {"usb": "USB 5 V supply", "battery": "Battery (LiPo 3S)"}.get(e.source, "Source unknown")
-        detail = f"{source} · {e.input_amps * 1000:,.0f} mA at {e.input_volts:g} V"
-        if e.runtime_h is not None:
-            detail += f"\nAbout {e.runtime_h:.0f} h on a full battery"
-        if not e.cpu_measured:
-            detail += "\nCPU load not reported: assumed"
-        self.power_detail.value = detail
 
 
 class MetricCard:

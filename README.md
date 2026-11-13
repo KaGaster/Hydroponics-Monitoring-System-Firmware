@@ -1041,6 +1041,10 @@ the PC USB). 6 power losses, 5 power-ons and 1 contact dip, over two runs:
 - The ADC and the GPIO input coexist on GPIO8 (`isr ok`, `mismatch 0`;
   1 `adc-disturbed` in the chatter of one transition).
 - Not covered: the + rail under sensor load, a slow cable pull, the power bank's own button.
+- 13 Nov 2026, ESP32 on the power bank alone (no PC USB): badly seated +/- rail jumpers made it
+  brown out at boot (reset reason `BROWNOUT`, no BLE advertising, a blinking board LED). Wi-Fi join
+  attempts made it worse. Fixed by reseating the rail cables. The app's Dashboard shows the last
+  reset reason under **Uptime**: a red "Brownout" there means check the supply wiring first.
 
 ## Lamp relay bring-up (`test_lamp`, ahead of WP7)
 
